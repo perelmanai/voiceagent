@@ -1,4 +1,7 @@
 # Aural Intel - Made by Interns Pranauv & Nandan
+*note the name Aural Intel is temporary set for testing.
+
+
 
 Real-time conversation co-pilot: speak into your phone, see a live transcript on the dashboard, and get Gemini-powered suggestion cards.
 
