@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Mirrors the dashboard's warm dark palette. -->
+    <color name="bg">#14100F</color>
+    <color name="surface">#1C1715</color>
+    <color name="border">#2A2320</color>
+    <color name="fg">#F1E8E3</color>
+    <color name="fg_muted">#A89A93</color>
+    <color name="fg_faint">#6A5F59</color>
+    <color name="accent">#F76D56</color>
+    <color name="confirm">#6DD49A</color>
+</resources>
