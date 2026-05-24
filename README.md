@@ -34,6 +34,7 @@ See `android-voice/README.md` for full setup details.
 ## Environment
 
 - `GEMINI_API_KEY` — required for suggestion cards (`/api/analyze`)
+
 ANOTHER IMPORTANT NOTE (Nandan Found This):
 Make sure you use a PAID GEMINI API Key, as a Free one will have rate limits and the analysis will not work as well as it would have otherwise.
 
