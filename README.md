@@ -1,4 +1,4 @@
-# Aural Intel
+# Aural Intel - Made by Interns Pranauv & Nandan
 
 Real-time conversation co-pilot: speak into your phone, see a live transcript on the dashboard, and get Gemini-powered suggestion cards.
 
