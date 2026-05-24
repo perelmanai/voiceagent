@@ -1,0 +1,85 @@
+- generic [active] [ref=e1]:
+  - main [ref=e2]:
+    - generic [ref=e3]:
+      - generic [ref=e4]:
+        - heading "Aural Intel" [level=1] [ref=e5]
+        - generic [ref=e8]: Idle
+        - generic [ref=e9]: 00:00:00
+      - button "Mic toggle" [ref=e10]:
+        - generic [ref=e11]: Mic toggle
+        - img [ref=e12]
+    - generic [ref=e15]:
+      - generic [ref=e21]:
+        - generic [ref=e22]: Awaiting audio
+        - generic [ref=e23]: Toggle the mic to start a session. Browser permission required.
+      - complementary [ref=e24]:
+        - generic [ref=e25]:
+          - heading "People" [level=2] [ref=e26]
+          - generic [ref=e28]:
+            - generic [ref=e29]:
+              - generic [ref=e30]:
+                - generic [ref=e31]: E
+                - generic [ref=e32]: 97% Conf.
+              - generic [ref=e33]:
+                - generic [ref=e34]: Elena Marsh
+                - generic [ref=e35]: Project Lead
+              - generic [ref=e36]: Quarterly Review
+            - generic [ref=e37]:
+              - generic [ref=e38]:
+                - generic [ref=e39]: M
+                - generic [ref=e40]: 91% Conf.
+              - generic [ref=e41]:
+                - generic [ref=e42]: Marcus Tovani
+                - generic [ref=e43]: Logistics Analyst
+              - generic [ref=e44]: Supply Chain
+            - generic [ref=e45]:
+              - generic [ref=e46]:
+                - generic [ref=e47]: P
+                - generic [ref=e48]: 93% Conf.
+              - generic [ref=e49]:
+                - generic [ref=e50]: Priya Joshi
+                - generic [ref=e51]: Financial Officer
+              - generic [ref=e52]: Q3 Planning
+        - generic [ref=e53]:
+          - heading "Events" [level=2] [ref=e54]
+          - generic [ref=e56]:
+            - generic [ref=e57]:
+              - generic [ref=e60]: Confirmed
+              - generic [ref=e61]: Q3 Strategy Meeting
+              - generic [ref=e62]: Tomorrow, 10:00 AM – 11:00 AM
+              - generic [ref=e63]: E. Marsh, M. Tovani, P. Joshi
+            - generic [ref=e64]:
+              - generic [ref=e67]: Tentative
+              - generic [ref=e68]: Logistics Sync
+              - generic [ref=e69]: Thu, 2:00 PM – 3:00 PM
+              - generic [ref=e70]: M. Tovani, Logistics Team
+        - generic [ref=e71]:
+          - generic [ref=e72]:
+            - heading "Suggestions" [level=2] [ref=e73]
+            - generic [ref=e74]: from context
+          - generic [ref=e76]: Nothing yet — Gemini surfaces actionable links here as you speak.
+        - generic [ref=e77]:
+          - heading "Tasks" [level=2] [ref=e78]
+          - list [ref=e80]:
+            - listitem [ref=e81]:
+              - generic [ref=e83]:
+                - generic [ref=e84]: Resolve Supply Chain Bottleneck
+                - generic [ref=e85]: Agent M. Tovani
+              - button "dispatch" [ref=e86]:
+                - text: dispatch
+                - img [ref=e87]
+            - listitem [ref=e89]:
+              - generic [ref=e91]:
+                - generic [ref=e92]: Update Q3 Financial Projections
+                - generic [ref=e93]: Agent P. Joshi
+              - button "dispatch" [ref=e94]:
+                - text: dispatch
+                - img [ref=e95]
+            - listitem [ref=e97]:
+              - generic [ref=e99]:
+                - generic [ref=e100]: Draft Meeting Minutes
+                - generic [ref=e101]: Agent E. Marsh
+              - button "dispatch" [ref=e102]:
+                - text: dispatch
+                - img [ref=e103]
+  - alert [ref=e105]
