@@ -22,11 +22,12 @@ export type CompletedTurn = { id: string; speaker: string; text: string };
 
 export const SENTENCE_QUIET_MS = 1800;
 export const UNPUNCTUATED_QUIET_MS = 3500;
+export const MAX_SPEECH_QUIET_MS = 5000;
 
 // Recognition's "final" means a stable audio chunk, not a finished thought.
 // These conservative English cues also work when ASR adds an early full stop.
 // Without a semantic model this is a heuristic: ambiguous unpunctuated speech
-// gets a longer quiet window; clearly dangling clauses wait for continuation.
+// gets a longer quiet window; dangling clauses use the bounded fallback below.
 export function sentenceQuietWindow(text: string): number | null {
   const clean = text.trim();
   if (!clean) return null;
@@ -62,7 +63,7 @@ function joinSegments(segments: Segment[]): string {
 export class SpeechConversation {
   private turns: Turn[] = [];
   private segments = new Map<string, { turn: Turn; segment: Segment }>();
-  private speaking = new Map<string, string>();
+  private speaking = new Map<string, { key: string; updatedAt: number }>();
   private activitySequence = new Map<string, number>();
   private nextId = 0;
 
@@ -91,7 +92,7 @@ export class SpeechConversation {
     }
 
     if (input.type === "pause") {
-      if (this.speaking.get(input.speaker) !== key) return { changed: false, completed: [] };
+      if (this.speaking.get(input.speaker)?.key !== key) return { changed: false, completed: [] };
       this.speaking.delete(input.speaker);
       for (const turn of this.turns) {
         if (turn.speaker === input.speaker && !turn.settled) turn.updatedAt = now;
@@ -108,7 +109,6 @@ export class SpeechConversation {
         for (const segment of turn.segments) {
           if (!segment.final) {
             segment.final = true;
-            turn.updatedAt = now;
             changed = true;
           }
         }
@@ -124,7 +124,7 @@ export class SpeechConversation {
 
     if (input.type === "activity") {
       if (previous?.segment.final) return { changed: false, completed: [] };
-      this.speaking.set(input.speaker, key);
+      this.speaking.set(input.speaker, { key, updatedAt: now });
       for (const turn of this.turns) {
         if (turn.speaker === input.speaker && !turn.settled) turn.updatedAt = now;
       }
@@ -134,6 +134,14 @@ export class SpeechConversation {
     const text = (input.text ?? "").replace(/\s+/g, " ").trim();
     if (!text) return { changed: false, completed: [] };
     const final = input.type === "final";
+    // A fallback may have already analyzed this exact preview. A late final
+    // confirms it without reopening the turn or issuing duplicate suggestions.
+    if (final && previous?.turn.settled && previous.segment.text === text) {
+      previous.segment.final = true;
+      previous.segment.sequence = sequence;
+      if (this.speaking.get(input.speaker)?.key === key) this.speaking.delete(input.speaker);
+      return { changed: false, completed: [] };
+    }
     // Replayed finals and late partials must neither duplicate words nor reopen
     // a sentence. A changed final may still correct its own stable segment ID.
     if (previous && (
@@ -143,7 +151,9 @@ export class SpeechConversation {
 
     // Android's activity and final share an utterance ID. Browser audio activity
     // has its own ID and ends via onspeechend: an older result must not clear it.
-    if (final && this.speaking.get(input.speaker) === key) this.speaking.delete(input.speaker);
+    const activity = this.speaking.get(input.speaker);
+    if (final && activity?.key === key) this.speaking.delete(input.speaker);
+    else if (activity) activity.updatedAt = now;
     if (previous) {
       previous.segment.text = text;
       previous.segment.final = final;
@@ -173,22 +183,34 @@ export class SpeechConversation {
 
   nextDeadline(): number | null {
     let deadline: number | null = null;
+    // Missing end/final callbacks must not leave the source marked as speaking
+    // forever, including when a noise-only cycle interrupted an analysis.
+    for (const activity of this.speaking.values()) {
+      deadline = Math.min(deadline ?? Infinity, activity.updatedAt + MAX_SPEECH_QUIET_MS);
+    }
     for (const turn of this.turns) {
-      if (turn.settled || this.speaking.get(turn.speaker) || turn.segments.some((segment) => !segment.final)) continue;
-      const delay = sentenceQuietWindow(joinSegments(turn.segments));
-      if (delay !== null) deadline = Math.min(deadline ?? Infinity, turn.updatedAt + delay);
+      if (turn.settled) continue;
+      deadline = Math.min(deadline ?? Infinity, this.turnDeadline(turn));
     }
     return deadline;
   }
 
   settle(now: number): CompletedTurn[] {
     const completed: CompletedTurn[] = [];
+    for (const [speaker, activity] of this.speaking) {
+      if (now >= activity.updatedAt + MAX_SPEECH_QUIET_MS) this.speaking.delete(speaker);
+    }
     for (const turn of this.turns) {
-      if (turn.settled || this.speaking.get(turn.speaker) || turn.segments.some((segment) => !segment.final)) continue;
-      const delay = sentenceQuietWindow(joinSegments(turn.segments));
-      if (delay !== null && now >= turn.updatedAt + delay) completed.push(this.complete(turn));
+      if (!turn.settled && now >= this.turnDeadline(turn)) completed.push(this.complete(turn));
     }
     return completed;
+  }
+
+  private turnDeadline(turn: Turn): number {
+    const fallback = turn.updatedAt + MAX_SPEECH_QUIET_MS;
+    if (this.speaking.has(turn.speaker) || turn.segments.some((segment) => !segment.final)) return fallback;
+    const delay = sentenceQuietWindow(joinSegments(turn.segments)) ?? MAX_SPEECH_QUIET_MS;
+    return Math.min(fallback, turn.updatedAt + delay);
   }
 
   private complete(turn: Turn): CompletedTurn {

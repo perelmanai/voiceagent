@@ -179,6 +179,12 @@ export function Dashboard() {
     if (completed.length) {
       setLines(conversationRef.current!.snapshot());
       void analyzeTurns(completed);
+    } else if (!conversationRef.current!.isSpeaking()
+      && conversationRef.current!.snapshot().every((line) => line.isFinal)
+      && !analysisControllerRef.current && analysisBacklogRef.current.length) {
+      // A recognizer may never send "end" after noise interrupts a request.
+      // The bounded activity timeout also resumes that interrupted analysis.
+      void analyzeTurns(analysisBacklogRef.current);
     }
     const deadline = conversationRef.current!.nextDeadline();
     if (deadline !== null) settleTimerRef.current = setTimeout(settleSpeech, Math.max(0, deadline - Date.now()));

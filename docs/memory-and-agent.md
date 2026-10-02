@@ -105,7 +105,7 @@ The right rail's three mock panels (People / Events / Tasks — hardcoded fake d
 
 Browser recognition and Android `activity` / `partial` / `final` / `end` / `stop` events feed the same `SpeechConversation` buffer. Stable utterance IDs let final results replace partial text and let retries be ignored. A recognizer's final result is only a stable audio chunk: it does not automatically finish the conversation turn.
 
-Completed, punctuated speech settles after 1.8 seconds of quiet; unpunctuated speech gets 3.5 seconds. Clearly unfinished English clauses stay open for their continuation, even if recognition added a premature period. Speech activity suspends the timer. Explicit Stop preserves the last partial and flushes it. This uses conservative text heuristics, so sentence completion is not a semantic guarantee for every language or phrasing.
+Completed, punctuated speech settles after 1.8 seconds of quiet; unpunctuated speech gets 3.5 seconds. Unfinished phrases and partial results get a maximum of 5 seconds without new speech/text events before the captured text is finalized and analyzed. This fallback also recovers from missing recognizer callbacks. New speech activity or changed text extends the window; duplicate events do not. Explicit Stop preserves the last partial and flushes it. This uses conservative English text heuristics, so sentence completion is not a semantic guarantee for every language or phrasing.
 
 Consecutive turns from the same speaker appear in readable blocks. Suggestions are analyzed from the assembled text, and resumed speech cancels stale responses. Older Android clients that send only `{code, text}` still work; install the updated Android app to stream partial text and activity too.
 
