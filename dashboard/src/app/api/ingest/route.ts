@@ -1,6 +1,5 @@
 import type { NextRequest } from "next/server";
 import { publish } from "@/lib/relay";
-import { parseSpeechPayload } from "@/lib/speech-protocol";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,7 +18,7 @@ export function OPTIONS() {
 }
 
 export async function POST(request: NextRequest) {
-  let body: unknown;
+  let body: { code?: string; text?: string };
   try {
     body = await request.json();
   } catch {
@@ -29,14 +28,16 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const parsed = parseSpeechPayload(body);
-  if (!parsed) {
+  const code = (body.code ?? "").trim().toUpperCase();
+  const text = (body.text ?? "").trim();
+
+  if (!code || !text) {
     return Response.json(
-      { ok: false, error: "Invalid pairing code or speech event" },
+      { ok: false, error: "Missing code or text" },
       { status: 400, headers: CORS }
     );
   }
 
-  publish(parsed.code, parsed.line);
+  publish(code, { text, ts: Date.now() });
   return Response.json({ ok: true }, { headers: CORS });
 }

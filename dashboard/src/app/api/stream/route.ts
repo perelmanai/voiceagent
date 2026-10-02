@@ -13,18 +13,15 @@ export async function GET(request: NextRequest) {
     .trim()
     .toUpperCase();
 
-  if (!/^[A-Z0-9]{1,32}$/.test(code)) {
-    return new Response("Invalid pairing code", { status: 400 });
+  if (!code) {
+    return new Response("Missing code", { status: 400 });
   }
 
   const encoder = new TextEncoder();
-  let cleanup = () => {};
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      let closed = false;
       const send = (event: string, data: unknown) => {
-        if (closed) return;
         controller.enqueue(
           encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
         );
@@ -51,11 +48,8 @@ export async function GET(request: NextRequest) {
       }, HEARTBEAT_MS);
 
       const close = () => {
-        if (closed) return;
-        closed = true;
         clearInterval(heartbeat);
         unsubscribe();
-        request.signal.removeEventListener("abort", close);
         try {
           controller.close();
         } catch {
@@ -63,11 +57,8 @@ export async function GET(request: NextRequest) {
         }
       };
 
-      cleanup = close;
       request.signal.addEventListener("abort", close);
-      if (request.signal.aborted) close();
     },
-    cancel() { cleanup(); },
   });
 
   return new Response(stream, {

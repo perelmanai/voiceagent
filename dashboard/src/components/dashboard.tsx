@@ -6,8 +6,6 @@ import { Header } from "./header";
 import { Waveform } from "./waveform";
 import { Transcript } from "./transcript";
 import type { Suggestion, TranscriptLine } from "@/lib/types";
-import { SpeechConversation, type CompletedTurn, type SpeechInput } from "@/lib/speech-conversation";
-import { parseSpeechPayload } from "@/lib/speech-protocol";
 
 const RightRail = dynamic(
   () => import("./right-rail").then((m) => m.RightRail),
@@ -24,6 +22,13 @@ const PairPanel = dynamic(
   { ssr: false }
 );
 
+function pad(n: number): string {
+  return String(n).padStart(2, "0");
+}
+function nowTs(): string {
+  const d = new Date();
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 function uid(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -40,11 +45,13 @@ function genPairingCode(): string {
 }
 
 const MAX_SUGGESTIONS = 8;
+const ANALYZE_DEBOUNCE_MS = 1200;
 
 export function Dashboard() {
   const [isRecording, setIsRecording] = useState(false);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [lines, setLines] = useState<TranscriptLine[]>([]);
+  const [interim, setInterim] = useState("");
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [supported, setSupported] = useState(true);
@@ -81,20 +88,16 @@ export function Dashboard() {
 
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const keepRunningRef = useRef(false);
-  const startingRef = useRef(false);
-  const mountedRef = useRef(true);
-  const mediaRef = useRef<MediaStream | null>(null);
-  const conversationRef = useRef<SpeechConversation | null>(null);
-  if (!conversationRef.current) conversationRef.current = new SpeechConversation();
-  const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const analysisControllerRef = useRef<AbortController | null>(null);
-  const analysisRevisionRef = useRef(0);
-  const analysisBacklogRef = useRef<CompletedTurn | null>(null);
+  const linesRef = useRef<TranscriptLine[]>([]);
+  const analyzeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingAnalysisRef = useRef<{ lastFinal: string; recent: string } | null>(
+    null
+  );
+  const seenUrlsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-    const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const Ctor =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
     setSupported(!!Ctor);
   }, []);
 
@@ -104,56 +107,35 @@ export function Dashboard() {
     return () => clearInterval(id);
   }, [isRecording]);
 
-  const cancelAnalysis = useCallback(() => {
-    analysisRevisionRef.current += 1;
-    analysisControllerRef.current?.abort();
-    analysisControllerRef.current = null;
-  }, []);
-
-  const analyzeTurn = useCallback(async (completed: CompletedTurn) => {
-    if (!mountedRef.current) return;
-    cancelAnalysis();
-    analysisBacklogRef.current = completed;
-    const revision = analysisRevisionRef.current;
-    const controller = new AbortController();
-    analysisControllerRef.current = controller;
-    const recent = conversationRef.current!.snapshot()
-      .filter((line) => line.isFinal && line.id !== completed.id)
-      .slice(-5)
-      .map((line) => `${line.speaker}: ${line.text}`)
-      .join("\n");
+  const runAnalysis = useCallback(async () => {
+    const payload = pendingAnalysisRef.current;
+    if (!payload) return;
+    pendingAnalysisRef.current = null;
     try {
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify({
-          lastFinal: completed.text,
-          recent,
-          code: pairingCodeRef.current,
-        }),
+        body: JSON.stringify({ ...payload, code: pairingCodeRef.current }),
       });
       if (!res.ok) return;
       const data: {
         suggestions?: Array<Partial<Suggestion>>;
         recalled?: Array<{ id: string }>;
       } = await res.json();
-      // A pause can resume while the model is answering. Never show suggestions
-      // for an older snapshot after speech has changed or the component unmounted.
-      if (controller.signal.aborted || revision !== analysisRevisionRef.current || !mountedRef.current) return;
-      analysisBacklogRef.current = null;
+      // Every analyze may write new memories server-side; nudge the panel.
       setMemoryRefreshKey((k) => k + 1);
-      if (Array.isArray(data.recalled)) setRecalledIds(data.recalled.map((r) => r.id));
+      if (Array.isArray(data.recalled)) {
+        setRecalledIds(data.recalled.map((r) => r.id));
+      }
       if (!Array.isArray(data.suggestions)) return;
       const fresh: Suggestion[] = [];
-      const seen = new Set<string>();
       for (const s of data.suggestions) {
         if (!s.title) continue;
         const isAgent = s.kind === "agent" && s.task?.trim();
         if (!isAgent && !s.url) continue;
         const dedupeKey = isAgent ? `agent:${s.task}` : s.url!;
-        if (seen.has(dedupeKey)) continue;
-        seen.add(dedupeKey);
+        if (seenUrlsRef.current.has(dedupeKey)) continue;
+        seenUrlsRef.current.add(dedupeKey);
         fresh.push({
           id: uid(),
           kind: (s.kind as Suggestion["kind"]) ?? "info",
@@ -165,212 +147,186 @@ export function Dashboard() {
           task: s.task,
         });
       }
-      setSuggestions(fresh.slice(0, MAX_SUGGESTIONS));
-    } catch {
-      // Aborted requests and transient network errors do not interrupt listening.
-    } finally {
-      if (analysisControllerRef.current === controller) analysisControllerRef.current = null;
-    }
-  }, [cancelAnalysis]);
-
-  const analyzeWhenQuiet = useCallback((completed: CompletedTurn[]) => {
-    const conversation = conversationRef.current!;
-    const snapshot = conversation.snapshot();
-    const latest = completed.find((turn) => turn.id === snapshot.at(-1)?.id);
-    if (latest) analysisBacklogRef.current = latest;
-    const pending = analysisBacklogRef.current;
-    // Once newer words exist, an interrupted request for the previous thought
-    // must never resume, even if a delayed timer just completed that old turn.
-    if (pending && pending.id !== snapshot.at(-1)?.id) {
-      analysisBacklogRef.current = null;
-      return;
-    }
-    if (pending && !conversation.isSpeaking() && snapshot.every((line) => line.isFinal)
-      && !analysisControllerRef.current) {
-      void analyzeTurn(pending);
-    }
-  }, [analyzeTurn]);
-
-  const settleSpeech = useCallback(() => {
-    settleTimerRef.current = null;
-    if (!mountedRef.current) return;
-    const completed = conversationRef.current!.settle(Date.now());
-    if (completed.length) {
-      setLines(conversationRef.current!.snapshot());
-    }
-    // Also resume a request interrupted by noise with no newer transcript text.
-    analyzeWhenQuiet(completed);
-    const deadline = conversationRef.current!.nextDeadline();
-    if (deadline !== null) settleTimerRef.current = setTimeout(settleSpeech, Math.max(0, deadline - Date.now()));
-  }, [analyzeWhenQuiet]);
-
-  const processSpeech = useCallback((input: SpeechInput) => {
-    if (!mountedRef.current) return;
-    const previousTurnId = conversationRef.current!.snapshot().at(-1)?.id;
-    const update = conversationRef.current!.accept(input, Date.now());
-    if (!update.changed) return;
-    cancelAnalysis();
-    if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
-    settleTimerRef.current = null;
-    const snapshot = conversationRef.current!.snapshot();
-    setLines(snapshot);
-    if (snapshot.at(-1)?.id !== previousTurnId) {
-      setSuggestions([]);
-      setRecalledIds([]);
-    }
-    analyzeWhenQuiet(update.completed);
-    const deadline = conversationRef.current!.nextDeadline();
-    if (deadline !== null) settleTimerRef.current = setTimeout(settleSpeech, Math.max(0, deadline - Date.now()));
-  }, [analyzeWhenQuiet, cancelAnalysis, settleSpeech]);
-
-  // Partial revisions and stable audio chunks from the phone use the same turn
-  // buffer as the local mic. Legacy phones can still send just {text}.
-  useEffect(() => {
-    if (!pairingCode) return;
-    const es = new EventSource(`/api/stream?code=${encodeURIComponent(pairingCode)}`);
-    es.addEventListener("line", (ev: MessageEvent) => {
-      try {
-        const data = JSON.parse(ev.data);
-        const parsed = parseSpeechPayload({ ...data, code: pairingCode });
-        if (!parsed) return;
-        const line = parsed.line;
-        setPhoneConnected(true);
-        setError(null);
-        processSpeech({
-          speaker: "Phone",
-          type: line.type ?? "final",
-          text: line.text,
-          utteranceId: line.utteranceId ?? uid(),
-          sequence: line.sequence,
-        });
-      } catch {
-        // Ignore malformed events without disrupting EventSource reconnection.
+      if (fresh.length) {
+        setSuggestions((prev) => [...fresh, ...prev].slice(0, MAX_SUGGESTIONS));
       }
-    });
-    return () => es.close();
-  }, [pairingCode, processSpeech]);
-
-  const releaseMicrophone = useCallback(() => {
-    mediaRef.current?.getTracks().forEach((track) => track.stop());
-    mediaRef.current = null;
-    setStream(null);
-    setIsRecording(false);
+    } catch {
+      // ignore network/parse errors in the live UI
+    }
   }, []);
 
-  const finishStop = useCallback(() => {
-    if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
-    stopTimerRef.current = null;
-    const rec = recognitionRef.current;
-    recognitionRef.current = null;
-    try { rec?.abort(); } catch {}
-    processSpeech({ speaker: "You", type: "stop", utteranceId: uid() });
-  }, [processSpeech]);
+  const scheduleAnalysis = useCallback(
+    (lastFinal: string, recent: string) => {
+      pendingAnalysisRef.current = { lastFinal, recent };
+      if (analyzeTimerRef.current) clearTimeout(analyzeTimerRef.current);
+      analyzeTimerRef.current = setTimeout(runAnalysis, ANALYZE_DEBOUNCE_MS);
+    },
+    [runAnalysis]
+  );
+
+  // Commit a finalized line (from the phone) into the same transcript + analysis
+  // pipeline the local mic uses, so suggestions work identically for both sources.
+  const commitLine = useCallback(
+    (speaker: string, text: string) => {
+      const clean = text.trim();
+      if (!clean) return;
+      const line: TranscriptLine = {
+        id: uid(),
+        ts: nowTs(),
+        speaker,
+        text: clean,
+        isFinal: true,
+      };
+      linesRef.current = [...linesRef.current, line];
+      setLines(linesRef.current);
+      const recent = linesRef.current
+        .slice(-6)
+        .map((l) => `${l.speaker}: ${l.text}`)
+        .join("\n");
+      scheduleAnalysis(clean, recent);
+    },
+    [scheduleAnalysis]
+  );
+
+  // Live-listen for transcripts pushed from the paired phone via SSE. The phone is
+  // the primary input; the local mic below remains available as a secondary source.
+  const commitLineRef = useRef(commitLine);
+  commitLineRef.current = commitLine;
+
+  useEffect(() => {
+    if (!pairingCode) return;
+    const es = new EventSource(
+      `/api/stream?code=${encodeURIComponent(pairingCode)}`
+    );
+    // The dashboard's own SSE stream is always open, so "connected" must mean a phone
+    // has actually delivered a line — not merely that this stream opened.
+    es.addEventListener("line", (ev: MessageEvent) => {
+      try {
+        const { text } = JSON.parse(ev.data) as { text: string };
+        setPhoneConnected(true);
+        setError(null);
+        commitLineRef.current("Phone", text);
+      } catch {
+        // ignore malformed events
+      }
+    });
+    // EventSource reconnects on its own; a transient drop shouldn't flip the phone
+    // indicator off, so we don't toggle state here.
+    return () => es.close();
+  }, [pairingCode]);
 
   const stop = useCallback(() => {
     keepRunningRef.current = false;
-    if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
-    restartTimerRef.current = null;
-    releaseMicrophone();
-    // stop() asks the recognizer for its last final result. Keep its callbacks
-    // alive until onend; if it never responds, preserve the visible partial.
-    if (recognitionRef.current) {
-      stopTimerRef.current = setTimeout(finishStop, 2000);
-      try { recognitionRef.current.stop(); } catch { finishStop(); }
-    } else {
-      finishStop();
+    try {
+      recognitionRef.current?.stop();
+    } catch {}
+    recognitionRef.current = null;
+    if (analyzeTimerRef.current) {
+      clearTimeout(analyzeTimerRef.current);
+      analyzeTimerRef.current = null;
     }
-  }, [finishStop, releaseMicrophone]);
+    setStream((s) => {
+      s?.getTracks().forEach((t) => t.stop());
+      return null;
+    });
+    setInterim("");
+    setIsRecording(false);
+  }, []);
 
   const start = useCallback(async () => {
-    if (startingRef.current || keepRunningRef.current) return;
-    if (recognitionRef.current) finishStop();
-    startingRef.current = true;
     setError(null);
-    const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const Ctor =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!Ctor) {
-      startingRef.current = false;
-      setError("This browser does not expose the Web Speech API. Open the app in Chrome, Edge, Comet, or another Chromium-based browser.");
+      setError(
+        "This browser does not expose the Web Speech API. Open the app in Chrome, Edge, Comet, or another Chromium-based browser."
+      );
       return;
     }
 
-    let media: MediaStream;
+    let s: MediaStream;
     try {
-      media = await navigator.mediaDevices.getUserMedia({ audio: true });
+      s = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch {
-      startingRef.current = false;
-      if (mountedRef.current) setError("Microphone permission was denied. Allow mic access in your browser, then toggle again.");
+      setError(
+        "Microphone permission was denied. Allow mic access in your browser, then toggle again."
+      );
       return;
     }
-    startingRef.current = false;
-    if (!mountedRef.current) {
-      media.getTracks().forEach((track) => track.stop());
-      return;
-    }
-    mediaRef.current = media;
-    setStream(media);
+    setStream(s);
     setElapsedSec(0);
 
     const rec = new Ctor();
-    const sessionId = uid();
-    let cycle = 0;
     rec.continuous = true;
     rec.interimResults = true;
     rec.lang = "en-US";
-    recognitionRef.current = rec;
 
-    const beginCycle = () => {
-      if (!keepRunningRef.current || recognitionRef.current !== rec) return;
-      cycle += 1;
-      try { rec.start(); } catch {
-        keepRunningRef.current = false;
-        releaseMicrophone();
-        finishStop();
-        setError("Speech recognition could not restart. Toggle the mic to try again.");
-      }
-    };
-    rec.onspeechstart = () => {
-      if (recognitionRef.current === rec) processSpeech({ speaker: "You", type: "activity", utteranceId: `${sessionId}:${cycle}:activity` });
-    };
-    rec.onspeechend = () => {
-      if (recognitionRef.current === rec) processSpeech({ speaker: "You", type: "pause", utteranceId: `${sessionId}:${cycle}:activity` });
-    };
     rec.onresult = (event) => {
-      if (recognitionRef.current !== rec) return;
+      let pending = "";
+      const linesToCommit: string[] = [];
       for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        processSpeech({
+        const r = event.results[i];
+        const text = r[0].transcript.trim();
+        if (r.isFinal) {
+          if (text) linesToCommit.push(text);
+        } else {
+          pending += r[0].transcript;
+        }
+      }
+      if (linesToCommit.length) {
+        const newLines: TranscriptLine[] = linesToCommit.map((t) => ({
+          id: uid(),
+          ts: nowTs(),
           speaker: "You",
-          type: result.isFinal ? "final" : "partial",
-          utteranceId: `${sessionId}:${cycle}:${i}`,
-          text: result[0].transcript,
-        });
+          text: t,
+          isFinal: true,
+        }));
+        linesRef.current = [...linesRef.current, ...newLines];
+        setLines(linesRef.current);
+        const recent = linesRef.current
+          .slice(-6)
+          .map((l) => `${l.speaker}: ${l.text}`)
+          .join("\n");
+        scheduleAnalysis(linesToCommit[linesToCommit.length - 1], recent);
       }
+      setInterim(pending);
     };
+
     rec.onerror = (event) => {
-      if (recognitionRef.current !== rec || event.error === "no-speech" || event.error === "aborted") return;
-      if (event.error === "not-allowed" || event.error === "service-not-allowed" || event.error === "audio-capture") {
-        setError("Microphone access is blocked or unavailable. Check site permissions and your microphone.");
-        keepRunningRef.current = false;
-        releaseMicrophone();
-        finishStop();
+      if (event.error === "no-speech" || event.error === "aborted") return;
+      if (
+        event.error === "not-allowed" ||
+        event.error === "service-not-allowed"
+      ) {
+        setError(
+          "Microphone access is blocked. Check site permissions in your browser."
+        );
       } else if (event.error === "network") {
-        setError("Speech recognition lost network connection. Check your connection.");
+        setError(
+          "Speech recognition lost network connection. Check your connection."
+        );
       }
     };
+
     rec.onend = () => {
-      if (recognitionRef.current !== rec) return;
-      if (!keepRunningRef.current) {
-        finishStop();
-        return;
+      if (keepRunningRef.current) {
+        try {
+          rec.start();
+        } catch {
+          // ignore — will be retried on next end
+        }
       }
-      processSpeech({ speaker: "You", type: "end", utteranceId: `${sessionId}:${cycle}:end` });
-      restartTimerRef.current = setTimeout(beginCycle, 250);
     };
 
     keepRunningRef.current = true;
+    try {
+      rec.start();
+    } catch {
+      // start() throws if already started — safe to swallow
+    }
+    recognitionRef.current = rec;
     setIsRecording(true);
-    beginCycle();
-  }, [finishStop, processSpeech, releaseMicrophone]);
+  }, [scheduleAnalysis]);
 
   const toggle = useCallback(() => {
     if (isRecording) stop();
@@ -381,21 +337,11 @@ export function Dashboard() {
     setRequestedTask({ task, nonce: Date.now() });
   }, []);
 
+  const stopRef = useRef(stop);
   useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      keepRunningRef.current = false;
-      if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
-      if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
-      if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
-      analysisControllerRef.current?.abort();
-      const rec = recognitionRef.current;
-      recognitionRef.current = null;
-      try { rec?.abort(); } catch {}
-      mediaRef.current?.getTracks().forEach((track) => track.stop());
-    };
-  }, []);
+    stopRef.current = stop;
+  }, [stop]);
+  useEffect(() => () => stopRef.current(), []);
 
   return (
     <main className="min-h-[100dvh] flex flex-col">
@@ -425,13 +371,14 @@ export function Dashboard() {
                 Edge, Comet, Arc).
               </div>
             )}
-            {lines.length === 0 ? (
+            {lines.length === 0 && !interim ? (
               <div className="flex-1 min-h-0 flex items-center justify-center">
                 <PairPanel code={pairingCode} connected={phoneConnected} />
               </div>
             ) : (
               <Transcript
                 lines={lines}
+                interim={interim}
                 isRecording={isRecording}
               />
             )}

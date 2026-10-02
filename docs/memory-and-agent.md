@@ -101,14 +101,6 @@ The right rail's three mock panels (People / Events / Tasks — hardcoded fake d
 - **Agent** — Codex/Claude selector, free-text task input, live step feed over SSE, stop button, result, and recent run history with provider labels.
 - **Memory** — everything the agent knows, searchable, with type/category/age, a reinforcement counter, per-item delete, and an accent highlight on memories recalled for the current suggestion round.
 
-### Conversation timing
-
-Browser recognition and Android `activity` / `partial` / `final` / `end` / `stop` events feed the same `SpeechConversation` buffer. Stable utterance IDs let final results replace partial text and let retries be ignored. A recognizer's final result is only a stable audio chunk: it does not automatically finish the conversation turn.
-
-Completed, punctuated speech settles after 1.8 seconds of quiet; unpunctuated speech gets 3.5 seconds. An explicit transition such as "Now I need…" after a complete chunk starts a new thought immediately. Unfinished phrases and partial results get a maximum of 5 seconds without new speech/text events before the captured text is finalized and analyzed. This fallback also recovers from missing recognizer callbacks. New speech activity or changed text extends the window; duplicate events do not. Explicit Stop preserves the last partial and flushes it. This uses conservative English text heuristics, so sentence completion is not a semantic guarantee for every language or phrasing.
-
-Each completed turn keeps its own transcript entry, even for the same speaker. Finished entries stay fixed: late recognizer corrections cannot reopen them, and a cumulative result's new words start a new entry. Overdue turns settle before a new event can extend their deadline. Suggestions follow only the latest completed thought; starting a new entry clears the previous topic's cards, and resumed speech cancels stale responses. Earlier context and memory only clarify the current thought. Older Android clients that send only `{code, text}` still work; install the updated Android app to stream partial text and activity too.
-
 ---
 
 ## Files
@@ -124,7 +116,6 @@ Each completed turn keeps its own transcript entry, even for the same speaker. F
 | `lib/agent.ts` | Provider dispatch, memory MCP server, run registry, SSE events |
 | `lib/codex-agent.ts` / `lib/codex-events.ts` | Codex SDK execution and event mapping |
 | `lib/codex-memory.ts` | Authenticated, per-run memory MCP bridge on loopback |
-| `lib/speech-conversation.ts` / `lib/speech-protocol.ts` | Shared turn assembly and phone event validation |
 | `api/memory/route.ts` | GET list/search · POST add · DELETE |
 | `api/agent/route.ts` | POST start · GET runs · DELETE stop |
 | `api/agent/stream/route.ts` | SSE replay + live step stream |

@@ -4,7 +4,7 @@
   "private": true,
   "packageManager": "pnpm@10.30.3",
   "scripts": {
-    "test": "node --test src/lib/*.test.mjs tests/*.test.mjs",
+    "test": "node --test src/lib/*.test.mjs",
     "dev": "next dev -H 0.0.0.0 --webpack",
     "build": "next build",
     "start": "next start -H 0.0.0.0"
