@@ -18,7 +18,7 @@ const globalRelay = globalThis as typeof globalThis & {
 };
 const listeners =
   globalRelay.__auralRelayListeners ??
-  (globalRelay.__auralRelayListeners = new Map());
+  (globalRelay.__auralRelayListeners = new Map<string, Set<EntryListener>>());
 
 function filePath(code: string): string {
   return path.join(DIR, `${code}.jsonl`);

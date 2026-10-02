@@ -40,3 +40,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local databases + browser profile
+/data/
+
+# Playwright MCP session artifacts written by agent runs
+/.playwright-mcp/

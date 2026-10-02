@@ -60,6 +60,16 @@ export function Dashboard() {
   // a random value in the initial render would cause a hydration mismatch.
   const [pairingCode, setPairingCode] = useState("");
   const [phoneConnected, setPhoneConnected] = useState(false);
+  // Memories the co-pilot recalled for the latest suggestion round (highlighted
+  // in the Memory panel), and a counter that tells the panel to re-fetch after
+  // server-side extraction has had a chance to run.
+  const [recalledIds, setRecalledIds] = useState<string[]>([]);
+  const [memoryRefreshKey, setMemoryRefreshKey] = useState(0);
+  // Agent tasks dispatched from suggestion cards flow to the AgentPanel here.
+  const [requestedTask, setRequestedTask] = useState<{
+    task: string;
+    nonce: number;
+  } | null>(null);
 
   useEffect(() => {
     const KEY = "aural-pairing-code";
@@ -72,6 +82,9 @@ export function Dashboard() {
       setPairingCode(fresh);
     }
   }, []);
+
+  const pairingCodeRef = useRef(pairingCode);
+  pairingCodeRef.current = pairingCode;
 
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const keepRunningRef = useRef(false);
@@ -102,24 +115,36 @@ export function Dashboard() {
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ ...payload, code: pairingCodeRef.current }),
       });
       if (!res.ok) return;
-      const data: { suggestions?: Array<Partial<Suggestion>> } = await res.json();
+      const data: {
+        suggestions?: Array<Partial<Suggestion>>;
+        recalled?: Array<{ id: string }>;
+      } = await res.json();
+      // Every analyze may write new memories server-side; nudge the panel.
+      setMemoryRefreshKey((k) => k + 1);
+      if (Array.isArray(data.recalled)) {
+        setRecalledIds(data.recalled.map((r) => r.id));
+      }
       if (!Array.isArray(data.suggestions)) return;
       const fresh: Suggestion[] = [];
       for (const s of data.suggestions) {
-        if (!s.url || !s.title) continue;
-        if (seenUrlsRef.current.has(s.url)) continue;
-        seenUrlsRef.current.add(s.url);
+        if (!s.title) continue;
+        const isAgent = s.kind === "agent" && s.task?.trim();
+        if (!isAgent && !s.url) continue;
+        const dedupeKey = isAgent ? `agent:${s.task}` : s.url!;
+        if (seenUrlsRef.current.has(dedupeKey)) continue;
+        seenUrlsRef.current.add(dedupeKey);
         fresh.push({
           id: uid(),
           kind: (s.kind as Suggestion["kind"]) ?? "info",
           title: s.title,
           description: s.description ?? "",
-          url: s.url,
-          actionLabel: s.actionLabel || "Open",
+          url: s.url ?? "",
+          actionLabel: s.actionLabel || (isAgent ? "Run agent" : "Open"),
           createdAt: Date.now(),
+          task: s.task,
         });
       }
       if (fresh.length) {
@@ -308,6 +333,10 @@ export function Dashboard() {
     else void start();
   }, [isRecording, start, stop]);
 
+  const runAgent = useCallback((task: string) => {
+    setRequestedTask({ task, nonce: Date.now() });
+  }, []);
+
   const stopRef = useRef(stop);
   useEffect(() => {
     stopRef.current = stop;
@@ -356,7 +385,14 @@ export function Dashboard() {
           </div>
         </section>
 
-        <RightRail suggestions={suggestions} />
+        <RightRail
+          suggestions={suggestions}
+          onRunAgent={runAgent}
+          requestedTask={requestedTask}
+          sessionCode={pairingCode}
+          memoryRefreshKey={memoryRefreshKey}
+          recalledIds={recalledIds}
+        />
       </div>
     </main>
   );
