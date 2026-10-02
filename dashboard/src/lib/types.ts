@@ -41,6 +41,7 @@ export type MemoryItem = {
 };
 
 export type AgentRunStatus = "running" | "done" | "error" | "cancelled";
+export type AgentProvider = "codex" | "claude";
 
 export type AgentStep = {
   n: number;
@@ -53,6 +54,7 @@ export type AgentStep = {
 export type AgentRun = {
   id: string;
   task: string;
+  provider: AgentProvider;
   status: AgentRunStatus;
   result: string | null;
   error: string | null;

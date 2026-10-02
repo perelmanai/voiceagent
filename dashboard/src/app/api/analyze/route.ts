@@ -92,6 +92,9 @@ export async function POST(request: NextRequest) {
   // Memory extraction runs after the response is sent — it must never add
   // latency to the live suggestion loop.
   after(async () => {
+    // Resumed speech cancels the superseded analysis in the dashboard. Avoid
+    // extracting memories from that older snapshot when the client disconnected.
+    if (request.signal.aborted) return;
     try {
       await extractAndStore(recent || lastFinal, sessionCode);
     } catch {

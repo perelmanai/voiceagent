@@ -17,7 +17,7 @@ import {
   StopCircle,
   Warning,
 } from "@phosphor-icons/react";
-import type { AgentRun, AgentStep } from "@/lib/types";
+import type { AgentProvider, AgentRun, AgentStep } from "@/lib/types";
 
 type Props = {
   /** Set by the dashboard when a suggestion card dispatches a task. */
@@ -48,8 +48,15 @@ const STATUS_COLOR: Record<string, string> = {
   cancelled: "var(--fg-faint, #6a5f59)",
 };
 
+const PROVIDER_LABEL: Record<AgentProvider, string> = {
+  codex: "Codex",
+  claude: "Claude",
+};
+
 export function AgentPanel({ requestedTask, sessionCode }: Props) {
   const [input, setInput] = useState("");
+  const [provider, setProvider] = useState<AgentProvider>("codex");
+  const [activeProvider, setActiveProvider] = useState<AgentProvider>("codex");
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [activeTask, setActiveTask] = useState("");
   const [steps, setSteps] = useState<AgentStep[]>([]);
@@ -59,6 +66,23 @@ export function AgentPanel({ requestedTask, sessionCode }: Props) {
   const [pastRuns, setPastRuns] = useState<AgentRun[]>([]);
   const stepsEndRef = useRef<HTMLDivElement | null>(null);
   const esRef = useRef<EventSource | null>(null);
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("aural-action-provider");
+      if (saved === "codex" || saved === "claude") setProvider(saved);
+    } catch {
+      // Storage can be disabled; Codex remains the default for this session.
+    }
+  }, []);
+
+  const chooseProvider = (value: string) => {
+    if (value !== "codex" && value !== "claude") return;
+    setProvider(value);
+    try {
+      localStorage.setItem("aural-action-provider", value);
+    } catch {}
+  };
 
   const loadRuns = useCallback(async () => {
     try {
@@ -118,12 +142,13 @@ export function AgentPanel({ requestedTask, sessionCode }: Props) {
       setResult(null);
       setSteps([]);
       setActiveTask(clean);
+      setActiveProvider(provider);
       setStatus("starting");
       try {
         const res = await fetch("/api/agent", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ task: clean, code: sessionCode }),
+          body: JSON.stringify({ task: clean, code: sessionCode, provider }),
         });
         const data: { runId?: string; error?: string } = await res.json();
         if (!res.ok || !data.runId) {
@@ -139,7 +164,7 @@ export function AgentPanel({ requestedTask, sessionCode }: Props) {
         setError("Failed to reach the agent API.");
       }
     },
-    [attachStream, sessionCode]
+    [attachStream, sessionCode, provider]
   );
 
   // Tasks dispatched from suggestion cards.
@@ -180,6 +205,21 @@ export function AgentPanel({ requestedTask, sessionCode }: Props) {
         </span>
       </div>
       <div className="rounded-2xl border border-border bg-surface/60 p-4">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <label htmlFor="action-provider" className="text-[11px] text-fg-muted">
+            Run actions with
+          </label>
+          <select
+            id="action-provider"
+            value={provider}
+            onChange={(event) => chooseProvider(event.target.value)}
+            disabled={running}
+            className="rounded-md border border-border bg-surface px-2 py-1 text-[12px] text-fg outline-none focus:border-border-strong disabled:opacity-50"
+          >
+            <option value="codex">Codex</option>
+            <option value="claude">Claude</option>
+          </select>
+        </div>
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -191,6 +231,7 @@ export function AgentPanel({ requestedTask, sessionCode }: Props) {
           className="flex items-center gap-2 rounded-lg border border-border bg-white/[0.02] px-2.5 py-2 focus-within:border-border-strong transition-colors"
         >
           <input
+            aria-label="Agent task"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             disabled={running}
@@ -226,7 +267,7 @@ export function AgentPanel({ requestedTask, sessionCode }: Props) {
                     className="text-[10px] tracking-wider uppercase font-medium"
                     style={{ color: STATUS_COLOR[status] ?? "var(--pending)" }}
                   >
-                    {status}
+                    {PROVIDER_LABEL[activeProvider]} · {status}
                   </span>
                   {running && (
                     <CircleNotch
@@ -315,6 +356,9 @@ export function AgentPanel({ requestedTask, sessionCode }: Props) {
                   }}
                 />
                 <span className="truncate">{r.task}</span>
+                <span className="ml-auto shrink-0 text-[10px] text-fg-faint">
+                  {PROVIDER_LABEL[r.provider] ?? "Claude"}
+                </span>
               </li>
             ))}
           </ul>

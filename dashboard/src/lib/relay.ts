@@ -1,8 +1,9 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
+import type { RelayLine } from "./speech-protocol";
 
-export type RelayLine = { text: string; ts: number };
+export type { RelayLine } from "./speech-protocol";
 
 type Entry = RelayLine & { id: string };
 type EntryListener = (entry: Entry) => void;
@@ -71,7 +72,9 @@ export function subscribe(
   const deliver = (entry: Entry) => {
     if (seen.has(entry.id)) return;
     seen.add(entry.id);
-    fn({ text: entry.text, ts: entry.ts });
+    if (seen.size > 2048) seen.delete(seen.values().next().value!);
+    const { id: _id, ...line } = entry;
+    fn(line);
   };
 
   const set = listeners.get(key) ?? new Set<EntryListener>();
@@ -79,6 +82,7 @@ export function subscribe(
   listeners.set(key, set);
 
   let offset = fs.statSync(file).size;
+  let remainder = "";
 
   const readNew = () => {
     try {
@@ -91,7 +95,9 @@ export function subscribe(
       fs.closeSync(fd);
       offset = size;
 
-      for (const raw of buf.toString("utf8").split("\n")) {
+      const rows = (remainder + buf.toString("utf8")).split("\n");
+      remainder = rows.pop() ?? "";
+      for (const raw of rows) {
         if (!raw.trim()) continue;
         try {
           deliver(JSON.parse(raw) as Entry);

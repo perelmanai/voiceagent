@@ -61,11 +61,11 @@ Results below 0.3 are dropped. **If embeddings are unavailable the vector weight
 
 ## 2. Agentic actions
 
-The agent **is Claude Code**, dispatched programmatically through the Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`). The dashboard doesn't run its own model loop anymore — it hands the task to Claude Code, which brings its own agent loop, context management (automatic compaction), retry handling, and web tools, then it maps Claude Code's message stream back onto the run/step UI.
+Actions can run with **Codex** through the official Codex SDK or **Claude Code** through the Claude Agent SDK. Codex is the default; the Agent panel remembers a user's provider selection. Both providers share the run registry, browser configuration, memory context, cancellation controls, and streamed history. Each stored run records its provider; existing rows migrate to `claude`.
 
 ### Browser control (`lib/mcp.ts`)
 
-Claude Code drives the browser through the same `@playwright/mcp` server as before — navigate, snapshot, click, type, fill forms, select, scroll, tabs, file upload, screenshots. Real browser control, not URL construction. `lib/mcp.ts` is now just the config builder: it produces the stdio server entry the Agent SDK passes to Claude Code, which spawns and owns the process (one per run).
+Both providers drive the browser through `@playwright/mcp`: navigate, snapshot, click, type, fill forms, select, scroll, tabs, and screenshots. `lib/mcp.ts` produces the stdio server configuration used for each run.
 
 - **Headed by default** so the user watches the work happen. `AGENT_HEADLESS=1` hides it.
 - Persistent profile at `data/browser-profile/`, so logins survive across runs.
@@ -73,25 +73,23 @@ Claude Code drives the browser through the same `@playwright/mcp` server as befo
 
 ### The dispatch (`lib/agent.ts`)
 
-One `query()` call per run, max 50 turns / 10 minutes:
+Runs have a 10-minute deadline and share a single browser lock:
 
 1. Recall memory for the task and build the prompt (today's date + memory block + task).
-2. Dispatch Claude Code with a locked-down surface: built-in tools limited to `WebSearch` + `WebFetch` (no shell, no filesystem), the Playwright MCP server, and an **in-process MCP server** exposing `recall_memory` / `save_memory` straight into the SQLite memory store. With the surface restricted, permission prompts are bypassed so the run is fully autonomous.
-3. Stream Claude Code's messages into steps: assistant text → *thought*, `tool_use` → *tool*, tool results → *observation*, the `result` message → *final* (or a mapped error for turn-limit / execution failures). A wall-clock timer aborts the run at the deadline; the stop button aborts it immediately.
+2. Dispatch the chosen provider with browser tools, web search, and memory access. Codex runs in an isolated working directory with shell tools disabled and a read-only sandbox. Claude's built-in tools are limited to `WebSearch` and `WebFetch`, with a 50-turn limit.
+3. Map provider events to the shared step format: messages, tool calls, observations, final results, and errors. A wall-clock timer aborts the run at the deadline; the stop button cancels the current run.
 
-`settingSources: []` keeps the machine's Claude Code settings and CLAUDE.md files out of the run, and `persistSession: false` keeps runs stateless — the dashboard's own SQLite tables are the history. Auth comes from the machine's Claude Code login (no API key needed); `CLAUDE_AGENT_MODEL` overrides the model.
+Authentication uses the selected provider's local login or explicitly configured API key. The app does not copy login tokens into its database or send them to the browser. See `dashboard/.env.example` for model and executable overrides.
 
-Every step is written to `agent_steps` and pushed to subscribers, so `/api/agent/stream` (SSE) can replay a run from the beginning and then follow it live — reload the page mid-run and the trace is intact.
-
-What used to be hand-rolled robustness code is now Claude Code's job: history compaction, rate-limit retries, and output truncation all happen inside the harness. If the browser MCP fails to connect, the init message reports it and the run continues search-only.
+Every step is written to `agent_steps` and pushed to subscribers, so `/api/agent/stream` (SSE) can replay a run from the beginning and then follow it live.
 
 ### Safety
 
-The system prompt forbids entering payment details, passwords, or verification codes, and forbids completing a purchase. The agent drives the flow to the last safe step — flight selected, cart ready, checkout open — then stops and explains how to finish. On top of the prompt, the tool surface itself is restricted: Claude Code gets no Bash, no file tools, no subagents — only the browser, web search/fetch, and the memory server. One run at a time (`isAgentBusy`), and any run can be stopped from the UI.
+The shared system prompt forbids entering payment details, passwords, or verification codes, and forbids completing a purchase. The agent drives the flow to the last safe step—flight selected, cart ready, checkout open—then stops and explains how to finish. Both providers restrict their tool surface to the needs of browser actions. Only one run can execute at a time (`isAgentBusy`), and any run can be stopped from the UI.
 
 ### Web search
 
-Claude Code's built-in `WebSearch` / `WebFetch` tools. `lib/search.ts` (Gemini-grounded search with a DuckDuckGo fallback) is no longer used by the agent and only remains in the tree as a utility.
+Codex uses its web search capability; Claude uses `WebSearch` / `WebFetch`. `lib/search.ts` remains a separate utility.
 
 ---
 
@@ -100,8 +98,16 @@ Claude Code's built-in `WebSearch` / `WebFetch` tools. `lib/search.ts` (Gemini-g
 The right rail's three mock panels (People / Events / Tasks — hardcoded fake data) are replaced by three live ones:
 
 - **Suggestions** — now includes a sixth kind, `agent`. When the model detects a multi-step *intent* rather than a lookup, the card carries a `task` string and its button dispatches the agent instead of opening a link.
-- **Agent** — free-text task input, live step feed over SSE, stop button, result, and recent run history.
+- **Agent** — Codex/Claude selector, free-text task input, live step feed over SSE, stop button, result, and recent run history with provider labels.
 - **Memory** — everything the agent knows, searchable, with type/category/age, a reinforcement counter, per-item delete, and an accent highlight on memories recalled for the current suggestion round.
+
+### Conversation timing
+
+Browser recognition and Android `activity` / `partial` / `final` / `end` / `stop` events feed the same `SpeechConversation` buffer. Stable utterance IDs let final results replace partial text and let retries be ignored. A recognizer's final result is only a stable audio chunk: it does not automatically finish the conversation turn.
+
+Completed, punctuated speech settles after 1.8 seconds of quiet; unpunctuated speech gets 3.5 seconds. Clearly unfinished English clauses stay open for their continuation, even if recognition added a premature period. Speech activity suspends the timer. Explicit Stop preserves the last partial and flushes it. This uses conservative text heuristics, so sentence completion is not a semantic guarantee for every language or phrasing.
+
+Consecutive turns from the same speaker appear in readable blocks. Suggestions are analyzed from the assembled text, and resumed speech cancels stale responses. Older Android clients that send only `{code, text}` still work; install the updated Android app to stream partial text and activity too.
 
 ---
 
@@ -115,7 +121,10 @@ The right rail's three mock panels (People / Events / Tasks — hardcoded fake d
 | `lib/memory.ts` | Extraction, consolidation, hybrid recall, CRUD |
 | `lib/mcp.ts` | Playwright MCP server config (browser detection, profile, flags) |
 | `lib/search.ts` | Grounded web search + DuckDuckGo fallback (unused by the agent) |
-| `lib/agent.ts` | Claude Code dispatch via the Agent SDK, memory MCP server, run registry, SSE events |
+| `lib/agent.ts` | Provider dispatch, memory MCP server, run registry, SSE events |
+| `lib/codex-agent.ts` / `lib/codex-events.ts` | Codex SDK execution and event mapping |
+| `lib/codex-memory.ts` | Authenticated, per-run memory MCP bridge on loopback |
+| `lib/speech-conversation.ts` / `lib/speech-protocol.ts` | Shared turn assembly and phone event validation |
 | `api/memory/route.ts` | GET list/search · POST add · DELETE |
 | `api/agent/route.ts` | POST start · GET runs · DELETE stop |
 | `api/agent/stream/route.ts` | SSE replay + live step stream |
@@ -124,6 +133,8 @@ The right rail's three mock panels (People / Events / Tasks — hardcoded fake d
 | `components/agent-panel.tsx` | Agent UI |
 
 ## Notes on models
+
+**Codex** (default action provider): uses the local Codex login, or `CODEX_API_KEY` / `OPENAI_API_KEY` when configured. `CODEX_AGENT_MODEL` selects a model and `CODEX_PATH` selects a local executable. See the [official SDK documentation](https://learn.chatgpt.com/docs/codex-sdk).
 
 **Gemini** (suggestions + memory): model **aliases** (`gemini-flash-latest`, `gemini-flash-lite-latest`) are used rather than pinned point versions — `gemini-2.5-flash` was already returning 404 "no longer available to new users" for new keys during development. Override via `GEMINI_FAST_MODEL` / `GEMINI_EMBEDDING_MODEL`. A paid key still matters for the live suggestion loop.
 

@@ -2,9 +2,8 @@ import type { NextConfig } from "next";
 import path from "path";
 
 const nextConfig: NextConfig = {
-  // The Agent SDK must stay unbundled: it locates its native Claude Code
-  // binary relative to its own file on disk, which bundling breaks.
-  serverExternalPackages: ["@anthropic-ai/claude-agent-sdk"],
+  // Agent SDKs locate native binaries relative to their package on disk.
+  serverExternalPackages: ["@anthropic-ai/claude-agent-sdk", "@openai/codex-sdk"],
   turbopack: {
     // Pin the workspace root to this project. Without this, Turbopack infers the
     // root from the nearest lockfile and a stray ~/package-lock.json makes it pick

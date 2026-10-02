@@ -2,7 +2,9 @@
   "name": "aiagent",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@10.30.3",
   "scripts": {
+    "test": "node --test src/lib/*.test.mjs tests/*.test.mjs",
     "dev": "next dev -H 0.0.0.0 --webpack",
     "build": "next build",
     "start": "next start -H 0.0.0.0"
@@ -11,6 +13,7 @@
     "@anthropic-ai/claude-agent-sdk": "^0.3.227",
     "@google/genai": "^2.12.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@openai/codex-sdk": "^0.159.3",
     "@phosphor-icons/react": "^2.1.10",
     "@playwright/mcp": "^0.0.78",
     "better-sqlite3": "^12.11.1",

@@ -1,20 +1,20 @@
 # Aural Voice (Android)
 
-A minimal Android app that transcribes your speech **on-device** and streams each
-finished line to the [Aural Intel dashboard](../dashboard) in real time.
+A minimal Android app that transcribes your speech **on-device** and streams live
+transcript revisions to the [Aural Intel dashboard](../dashboard) in real time.
 
 Speak into your phone → lines appear in the dashboard transcript instantly.
 
 ## How it works
 
 ```
-SpeechRecognizer (on device) → POST {code, text} → <dashboard>/api/ingest
+SpeechRecognizer (on device) → POST speech events → <dashboard>/api/ingest
                                                         │ in-memory relay (pairing code)
                                                         ▼
                                   dashboard browser ← SSE /api/stream
 ```
 
-The phone never uploads audio — only finalized text. A short **pairing code** shown in
+The phone never uploads audio — only text and speech activity events. A short **pairing code** shown in
 the dashboard header keys the relay so your transcript only reaches your dashboard.
 
 ## Setup
@@ -59,7 +59,16 @@ so let Android Studio provide Gradle:
 ## Notes
 
 - On-device recognition restarts between utterances, so there's a brief gap between
-  phrases — this is normal for Android's `SpeechRecognizer` API.
+  phrases — this is normal for Android's `SpeechRecognizer` API. These restarts do
+  not end the conversation turn; the dashboard groups the text across short pauses.
+- Each event includes `code`, `text`, `type` (`activity`, `partial`, `final`, `end`,
+  or `stop`), `utteranceId`, and `sequence`. Revisions share an utterance ID, while
+  retries reuse the identical event so the dashboard can ignore duplicates.
+- An `end` event clears speech activity when a recognition cycle ends without any
+  text (for example, a cough). It leaves an unfinished conversation turn open.
+- **Stop** waits briefly for the recognizer's final words, then flushes any remaining
+  partial text before ending the turn. The phone log groups text from one listening
+  session together instead of starting a new line at every recognition pause.
 - The relay is in-memory: if you refresh the dashboard a new pairing code is generated
   and you'll need to re-scan the QR.
 - The relay assumes a single dashboard process (`next dev`). Transcripts are not persisted.

@@ -51,6 +51,7 @@ END;
 CREATE TABLE IF NOT EXISTS agent_runs (
   id TEXT PRIMARY KEY,
   task TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT 'claude',
   status TEXT NOT NULL,                   -- running | done | error | cancelled
   result TEXT,
   error TEXT,
@@ -73,7 +74,10 @@ CREATE INDEX IF NOT EXISTS idx_agent_steps_run ON agent_steps(run_id, n);
 `;
 
 export function getDb(): Database.Database {
-  if (globalDb.__auralDb) return globalDb.__auralDb;
+  if (globalDb.__auralDb) {
+    migrateAgentProvider(globalDb.__auralDb);
+    return globalDb.__auralDb;
+  }
 
   const dir = path.join(process.cwd(), "data");
   fs.mkdirSync(dir, { recursive: true });
@@ -82,7 +86,19 @@ export function getDb(): Database.Database {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.exec(SCHEMA);
+  migrateAgentProvider(db);
 
   globalDb.__auralDb = db;
   return db;
+}
+
+// Also run on a cached connection so upgrading during dev hot reload works.
+const migratedConnections = new WeakSet<Database.Database>();
+function migrateAgentProvider(db: Database.Database): void {
+  if (migratedConnections.has(db)) return;
+  const columns = db.pragma("table_info(agent_runs)") as { name: string }[];
+  if (!columns.some((column) => column.name === "provider")) {
+    db.exec("ALTER TABLE agent_runs ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'");
+  }
+  migratedConnections.add(db);
 }

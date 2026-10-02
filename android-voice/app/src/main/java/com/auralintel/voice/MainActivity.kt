@@ -29,13 +29,13 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * Captures speech on-device with [SpeechRecognizer] and pushes each finalized line to
- * the dashboard's POST /api/ingest endpoint, keyed by a pairing code. Mirrors the
- * dashboard's browser behavior: continuous listening via a restart loop.
+ * Streams speech activity and transcript revisions to the dashboard. Recognition
+ * cycles remain separate from conversation turns, so a natural pause is not a stop.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -51,9 +51,22 @@ class MainActivity : AppCompatActivity() {
 
     private var recognizer: SpeechRecognizer? = null
     private var listening = false
+    private var stopping = false
+    private var destroyed = false
+    private var recognitionActive = false
+    private var utteranceId = ""
+    private var partialText = ""
+    private var sequence = 0L
+    private var newLogParagraph = true
 
     private val net: ExecutorService = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
+    private val restartRecognition = Runnable {
+        if (listening && !destroyed) beginRecognition()
+    }
+    private val stopTimeout = Runnable {
+        if (stopping) finishStop()
+    }
 
     companion object {
         private const val PREFS = "aural_voice"
@@ -131,6 +144,7 @@ class MainActivity : AppCompatActivity() {
     // --- Listening lifecycle ---------------------------------------------------
 
     private fun startListening() {
+        if (listening || stopping || destroyed) return
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             status("Speech recognition is not available on this device.")
             return
@@ -150,35 +164,66 @@ class MainActivity : AppCompatActivity() {
 
         savePrefs()
         setInputsEnabled(false)
+        main.removeCallbacks(restartRecognition)
+        main.removeCallbacks(stopTimeout)
+        sequence = 0L
+        newLogParagraph = true
         listening = true
-        ensureRecognizer()
         beginRecognition()
         updateButton()
         status("Listening…")
     }
 
     private fun stopListening() {
+        if (!listening || stopping) return
         listening = false
-        try {
-            recognizer?.cancel()
-        } catch (e: Exception) {
-            Log.e(TAG, "cancel failed", e)
+        stopping = true
+        main.removeCallbacks(restartRecognition)
+        updateButton()
+        status("Finishing your last words…")
+        if (!recognitionActive) {
+            finishStop()
+            return
         }
+        main.postDelayed(stopTimeout, 2000)
+        try {
+            // Unlike cancel(), this requests the final result for captured audio.
+            recognizer?.stopListening()
+        } catch (e: Exception) {
+            Log.e(TAG, "stopListening failed", e)
+            finishStop()
+        }
+    }
+
+    private fun finishStop() {
+        main.removeCallbacks(stopTimeout)
+        main.removeCallbacks(restartRecognition)
+        flushPartial()
+        recognitionActive = false
+        stopping = false
+        send("stop", "")
+        releaseRecognizer()
         interimText.text = ""
         setInputsEnabled(true)
         updateButton()
         status("Stopped")
     }
 
-    private fun ensureRecognizer() {
-        if (recognizer == null) {
-            recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
-                setRecognitionListener(listener)
-            }
+    private fun releaseRecognizer() {
+        try {
+            recognizer?.destroy()
+        } catch (e: Exception) {
+            Log.e(TAG, "destroy failed", e)
         }
+        recognizer = null
     }
 
     private fun beginRecognition() {
+        if (!listening || destroyed) return
+        releaseRecognizer()
+        utteranceId = UUID.randomUUID().toString()
+        partialText = ""
+        recognitionActive = true
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(
                 RecognizerIntent.EXTRA_LANGUAGE_MODEL,
@@ -189,8 +234,14 @@ class MainActivity : AppCompatActivity() {
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
         }
         try {
+            // Capture the cycle ID in its listener so late callbacks cannot be
+            // mistaken for revisions of the next recognition cycle.
+            recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
+                setRecognitionListener(listenerFor(utteranceId))
+            }
             recognizer?.startListening(intent)
         } catch (e: Exception) {
+            recognitionActive = false
             Log.e(TAG, "startListening failed", e)
             restartSoon()
         }
@@ -199,48 +250,69 @@ class MainActivity : AppCompatActivity() {
     /** Restart the recognizer to keep listening across utterances. */
     private fun restartSoon() {
         if (!listening) return
-        main.postDelayed({
-            if (!listening) return@postDelayed
-            try {
-                recognizer?.cancel()
-                beginRecognition()
-            } catch (e: Exception) {
-                Log.e(TAG, "restart failed", e)
-            }
-        }, 350)
+        main.removeCallbacks(restartRecognition)
+        main.postDelayed(restartRecognition, 350)
     }
 
-    private val listener = object : RecognitionListener {
+    private fun listenerFor(cycleId: String) = object : RecognitionListener {
+        private fun isCurrent() =
+            !destroyed && recognitionActive && cycleId == utteranceId
+
         override fun onReadyForSpeech(params: Bundle?) {}
-        override fun onBeginningOfSpeech() {}
+        override fun onBeginningOfSpeech() {
+            if (isCurrent()) send("activity", "")
+        }
         override fun onRmsChanged(rmsdB: Float) {}
         override fun onBufferReceived(buffer: ByteArray?) {}
         override fun onEndOfSpeech() {}
 
         override fun onPartialResults(partialResults: Bundle?) {
-            firstResult(partialResults)?.let { interimText.text = it }
+            if (!isCurrent()) return
+            val text = firstResult(partialResults) ?: return
+            if (text.isNotBlank() && text != partialText) {
+                partialText = text
+                interimText.text = text
+                send("partial", text)
+            }
         }
 
         override fun onResults(results: Bundle?) {
+            if (!isCurrent()) return
+            recognitionActive = false
             interimText.text = ""
             val text = firstResult(results)
-            if (!text.isNullOrBlank()) {
-                appendLine(text)
-                send(text)
+            if (!text.isNullOrBlank()) partialText = text
+            val hadText = flushPartial()
+            if (stopping) {
+                finishStop()
+            } else {
+                if (!hadText) send("end", "")
+                restartSoon()
             }
-            restartSoon()
         }
 
         override fun onError(error: Int) {
+            if (!isCurrent()) return
+            recognitionActive = false
+            val hadText = flushPartial()
+            interimText.text = ""
+            if (stopping) {
+                finishStop()
+                return
+            }
             when (error) {
                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
                     listening = false
-                    setInputsEnabled(true)
-                    updateButton()
+                    finishStop()
                     status("Microphone permission is required.")
                 }
                 // No-match / timeout / busy are normal during continuous use — restart.
-                else -> restartSoon()
+                else -> {
+                    // A cough/no-match can emit activity without any transcript.
+                    // Clear that activity without treating a pause as user Stop.
+                    if (!hadText) send("end", "")
+                    restartSoon()
+                }
             }
         }
 
@@ -250,22 +322,39 @@ class MainActivity : AppCompatActivity() {
     private fun firstResult(b: Bundle?): String? =
         b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.trim()
 
+    private fun flushPartial(): Boolean {
+        if (partialText.isBlank()) return false
+        appendLine(partialText)
+        send("final", partialText)
+        partialText = ""
+        return true
+    }
+
     // --- Networking ------------------------------------------------------------
 
-    /** POST {code, text} to <baseUrl>/api/ingest off the main thread, retry once. */
-    private fun send(text: String) {
+    /** Preserve event order and retry the identical IDs/body for server deduplication. */
+    private fun send(type: String, text: String) {
         val base = baseUrl()
         val pairCode = code()
+        val payload = JSONObject()
+            .put("code", pairCode)
+            .put("text", text)
+            .put("type", type)
+            .put("utteranceId", utteranceId)
+            .put("sequence", ++sequence)
+            .toString()
         net.execute {
-            if (!postOnce(base, pairCode, text)) {
-                if (!postOnce(base, pairCode, text)) {
-                    main.post { status("Send failed — check the URL and that the dashboard is reachable.") }
+            if (!postOnce(base, payload)) {
+                if (!postOnce(base, payload)) {
+                    main.post {
+                        if (!destroyed) status("Send failed — check the URL and that the dashboard is reachable.")
+                    }
                 }
             }
         }
     }
 
-    private fun postOnce(base: String, pairCode: String, text: String): Boolean {
+    private fun postOnce(base: String, payload: String): Boolean {
         var conn: HttpURLConnection? = null
         return try {
             conn = (URL("$base/api/ingest").openConnection() as HttpURLConnection).apply {
@@ -275,11 +364,10 @@ class MainActivity : AppCompatActivity() {
                 doOutput = true
                 setRequestProperty("Content-Type", "application/json")
             }
-            val payload = JSONObject().put("code", pairCode).put("text", text).toString()
             conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
             val rc = conn.responseCode
             if (rc in 200..299) {
-                main.post { if (listening) status("Sent ✓  ·  listening…") }
+                main.post { if (listening && !destroyed) status("Connected ✓  ·  listening…") }
                 true
             } else {
                 Log.w(TAG, "ingest returned $rc")
@@ -323,12 +411,18 @@ class MainActivity : AppCompatActivity() {
     private fun appendLine(text: String) {
         val ts = DateFormat.format("HH:mm:ss", Date()).toString()
         val existing = logText.text
-        logText.text = if (existing.isNullOrEmpty()) "[$ts] $text" else "$existing\n[$ts] $text"
+        logText.text = when {
+            existing.isNullOrEmpty() -> "[$ts] $text"
+            newLogParagraph -> "$existing\n[$ts] $text"
+            else -> "$existing $text"
+        }
+        newLogParagraph = false
         logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
     }
 
     private fun updateButton() {
-        micButton.text = if (listening) "Stop" else "Start mic"
+        micButton.text = if (stopping) "Finishing…" else if (listening) "Stop" else "Start mic"
+        micButton.isEnabled = !stopping
     }
 
     private fun setInputsEnabled(enabled: Boolean) {
@@ -361,13 +455,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        listening = false
-        try {
-            recognizer?.destroy()
-        } catch (e: Exception) {
-            Log.e(TAG, "destroy failed", e)
+        main.removeCallbacks(restartRecognition)
+        main.removeCallbacks(stopTimeout)
+        if (listening || stopping) {
+            // An Activity teardown cannot wait for another recognition callback.
+            // Queue the last visible words before the stop event, then drain sends.
+            flushPartial()
+            send("stop", "")
         }
-        net.shutdownNow()
+        listening = false
+        stopping = false
+        recognitionActive = false
+        destroyed = true
+        releaseRecognizer()
+        net.shutdown()
         super.onDestroy()
     }
 }
