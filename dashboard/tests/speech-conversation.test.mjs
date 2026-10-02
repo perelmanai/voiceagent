@@ -146,11 +146,10 @@ test('stop and onend after a settled turn are no-ops so an in-flight analysis is
   assert.deepEqual(send(buffer, 'stop', '', 2100, 'stop'), { changed: false, completed: [] });
 });
 
-test('a corrected final updates its original turn rather than appending a duplicate', () => {
+test('a corrected final replaces text only while its turn is still open', () => {
   const buffer = new SpeechConversation();
   send(buffer, 'final', 'Find Austin hotels.', 0, 'one', 1);
-  buffer.settle(SENTENCE_QUIET_MS);
-  send(buffer, 'final', 'Find Boston hotels.', 2500, 'one', 2);
+  send(buffer, 'final', 'Find Boston hotels.', 1000, 'one', 2);
   assert.equal(buffer.snapshot().length, 1);
   assert.equal(buffer.snapshot()[0].text, 'Find Boston hotels.');
   assert.equal(buffer.snapshot()[0].isFinal, false);
@@ -217,16 +216,16 @@ test('repeated unchanged partials and network retries cannot extend waiting fore
   assert.equal(buffer.settle(MAX_SPEECH_QUIET_MS).length, 1);
 });
 
-test('a late real final can correct a timed-out partial without duplicating the turn', () => {
+test('a late rewrite cannot reopen or change a timed-out turn', () => {
   const buffer = new SpeechConversation();
   send(buffer, 'partial', 'Find Austin hotels', 0, 'one', 1);
   buffer.settle(MAX_SPEECH_QUIET_MS);
   assert.equal(buffer.snapshot()[0].isFinal, true);
-  send(buffer, 'final', 'Find Boston hotels.', MAX_SPEECH_QUIET_MS + 100, 'one', 2);
+  assert.equal(send(buffer, 'final', 'Find Boston hotels.', MAX_SPEECH_QUIET_MS + 100, 'one', 2).changed, false);
   assert.equal(buffer.snapshot().length, 1);
-  assert.equal(buffer.snapshot()[0].text, 'Find Boston hotels.');
-  assert.equal(buffer.snapshot()[0].isFinal, false);
-  assert.equal(buffer.settle(MAX_SPEECH_QUIET_MS + 100 + SENTENCE_QUIET_MS).length, 1);
+  assert.equal(buffer.snapshot()[0].text, 'Find Austin hotels');
+  assert.equal(buffer.snapshot()[0].isFinal, true);
+  assert.equal(buffer.settle(MAX_SPEECH_QUIET_MS + 100 + SENTENCE_QUIET_MS).length, 0);
 });
 
 test('each speaker times out independently without clearing newer speech from another source', () => {
@@ -272,15 +271,139 @@ test('an unchanged late final confirms a timed-out preview without reanalyzing i
   assert.deepEqual(buffer.settle(MAX_SPEECH_QUIET_MS + 10_000), []);
 });
 
-test('a newer partial can revise a fallback result until the recognizer sends its real final', () => {
+test('a cumulative partial after timeout puts only the new suffix in a separate turn', () => {
   const buffer = new SpeechConversation();
   send(buffer, 'partial', 'Find hotels near', 0, 'one', 1);
   buffer.settle(MAX_SPEECH_QUIET_MS);
   send(buffer, 'partial', 'Find hotels near Boston', MAX_SPEECH_QUIET_MS + 100, 'one', 2);
-  assert.equal(buffer.snapshot().length, 1);
-  assert.equal(buffer.snapshot()[0].text, 'Find hotels near Boston');
-  assert.equal(buffer.snapshot()[0].isFinal, false);
+  assert.equal(buffer.snapshot().length, 2);
+  assert.deepEqual(buffer.snapshot().map((line) => [line.text, line.isFinal]), [['Find hotels near', true], ['Boston', false]]);
   send(buffer, 'final', 'Find hotels near Boston.', MAX_SPEECH_QUIET_MS + 200, 'one', 3);
   assert.equal(buffer.settle(MAX_SPEECH_QUIET_MS + 200 + SENTENCE_QUIET_MS).length, 1);
+  assert.equal(buffer.snapshot().length, 2);
+});
+
+test('new text arriving after a delayed timer deadline closes the previous turn first', () => {
+  const buffer = new SpeechConversation();
+  send(buffer, 'final', 'Find pizza.', 0, 'one', 1);
+  const update = send(buffer, 'partial', 'Look for hotels', SENTENCE_QUIET_MS + 100, 'two', 1);
+  assert.deepEqual(update.completed.map((turn) => turn.text), ['Find pizza.']);
+  assert.equal(update.changed, true);
+  assert.deepEqual(buffer.snapshot().map((line) => [line.text, line.isFinal]), [['Find pizza.', true], ['Look for hotels', false]]);
+});
+
+test('new activity after a quiet deadline cannot extend or reopen the finished thought', () => {
+  const buffer = new SpeechConversation();
+  send(buffer, 'final', 'Find coffee near Union Square', 0, 'one');
+  const update = send(buffer, 'activity', '', UNPUNCTUATED_QUIET_MS + 100, 'audio');
+  assert.deepEqual(update.completed.map((turn) => turn.text), ['Find coffee near Union Square']);
+  send(buffer, 'partial', 'Now find a bookstore', UNPUNCTUATED_QUIET_MS + 200, 'two');
+  assert.deepEqual(buffer.snapshot().map((line) => [line.text, line.isFinal]), [['Find coffee near Union Square', true], ['Now find a bookstore', false]]);
+});
+
+test('even an ignored retry returns any turn completed by an overdue deadline', () => {
+  const buffer = new SpeechConversation();
+  send(buffer, 'final', 'Find pizza.', 0, 'one', 1);
+  const update = send(buffer, 'final', 'Find pizza.', SENTENCE_QUIET_MS + 1, 'one', 1);
+  assert.equal(update.changed, true);
+  assert.deepEqual(update.completed.map((turn) => turn.text), ['Find pizza.']);
+  assert.equal(buffer.snapshot()[0].isFinal, true);
+  assert.equal(buffer.nextDeadline(), null);
+});
+
+test('repeated cumulative ASR updates create distinct turns without replaying their frozen prefixes', () => {
+  const buffer = new SpeechConversation();
+  send(buffer, 'partial', 'Book a flight', 0, 'one', 1);
+  buffer.settle(MAX_SPEECH_QUIET_MS);
+  const first = buffer.snapshot()[0];
+  send(buffer, 'partial', 'Book a flight Find hotels', 5100, 'one', 2);
+  send(buffer, 'partial', 'Book a flight Find hotels near Paris', 5200, 'one', 3);
+  send(buffer, 'final', 'Book a flight. Find hotels near Paris.', 5300, 'one', 4);
+  assert.deepEqual(buffer.snapshot().map((line) => line.text), ['Book a flight', 'Find hotels near Paris.']);
+  buffer.settle(5300 + SENTENCE_QUIET_MS);
+  const second = buffer.snapshot()[1];
+  send(buffer, 'partial', 'Book a flight. Find hotels near Paris. Compare restaurants', 7200, 'one', 5);
+  assert.deepEqual(buffer.snapshot().map((line) => line.text), ['Book a flight', 'Find hotels near Paris.', 'Compare restaurants']);
+  assert.deepEqual(buffer.snapshot()[0], first);
+  assert.deepEqual(buffer.snapshot()[1], second);
+});
+
+test('cumulative prefix matching tolerates ASR punctuation and casing changes', () => {
+  const buffer = new SpeechConversation();
+  send(buffer, 'final', 'Book a Flight.', 0, 'one', 1);
+  buffer.settle(SENTENCE_QUIET_MS);
+  send(buffer, 'partial', 'book a flight, Find a hotel', 1900, 'one', 2);
+  assert.deepEqual(buffer.snapshot().map((line) => [line.text, line.isFinal]), [['Book a Flight.', true], ['Find a hotel', false]]);
+});
+
+test('late rewrites or cumulative tails from an older recognition ID cannot change the current turn', () => {
+  const buffer = new SpeechConversation();
+  send(buffer, 'final', 'Find pizza.', 0, 'one', 1);
+  buffer.settle(SENTENCE_QUIET_MS);
+  send(buffer, 'partial', 'Compare hotel prices', 2000, 'two', 1);
+  const before = buffer.snapshot();
+  const deadline = buffer.nextDeadline();
+  assert.equal(send(buffer, 'final', 'Find pasta.', 2100, 'one', 2).changed, false);
+  assert.equal(send(buffer, 'partial', 'Find pizza. Order a drink', 2200, 'one', 3).changed, false);
+  assert.deepEqual(buffer.snapshot(), before);
+  assert.equal(buffer.nextDeadline(), deadline);
+});
+
+test('resuming an unfinished sentence after its five-second ceiling starts a new turn', () => {
+  const buffer = new SpeechConversation();
+  send(buffer, 'final', 'I want to go to', 0, 'one');
+  const update = send(buffer, 'final', 'Paris tomorrow.', MAX_SPEECH_QUIET_MS + 1, 'two');
+  assert.deepEqual(update.completed.map((turn) => turn.text), ['I want to go to']);
+  assert.deepEqual(buffer.snapshot().map((line) => [line.text, line.isFinal]), [['I want to go to', true], ['Paris tomorrow.', false]]);
+});
+
+test('an explicit new topic starts a distinct turn even before the short silence timer expires', () => {
+  const buffer = new SpeechConversation();
+  send(buffer, 'final', 'Find pizza.', 0, 'one');
+  const update = send(buffer, 'final', 'Now I need a hotel.', 700, 'two');
+  assert.deepEqual(update.completed.map((turn) => turn.text), ['Find pizza.']);
+  assert.deepEqual(buffer.snapshot().map((line) => [line.text, line.isFinal]), [['Find pizza.', true], ['Now I need a hotel.', false]]);
+});
+
+test('a topic transition recognized over successive partials splits off only the new segment', () => {
+  const buffer = new SpeechConversation();
+  send(buffer, 'final', 'Find pizza.', 0, 'one');
+  send(buffer, 'partial', 'Now', 600, 'two');
+  const update = send(buffer, 'partial', 'Now I need a hotel', 700, 'two');
+  assert.deepEqual(update.completed.map((turn) => turn.text), ['Find pizza.']);
+  assert.deepEqual(buffer.snapshot().map((line) => [line.text, line.isFinal]), [['Find pizza.', true], ['Now I need a hotel', false]]);
+  send(buffer, 'final', 'Now I need a hotel near the airport.', 800, 'two');
+  assert.deepEqual(buffer.snapshot().map((line) => line.text), ['Find pizza.', 'Now I need a hotel near the airport.']);
+});
+
+test('a quick modifier remains part of the same thought without an explicit topic change', () => {
+  const buffer = new SpeechConversation();
+  send(buffer, 'final', 'Find pizza.', 0, 'one');
+  const update = send(buffer, 'final', 'near my hotel.', 700, 'two');
+  assert.deepEqual(update.completed, []);
   assert.equal(buffer.snapshot().length, 1);
+  assert.equal(buffer.snapshot()[0].text, 'Find pizza. near my hotel.');
+});
+
+test('a correction to a frozen word does not discard an explicit new-topic tail', () => {
+  const buffer = new SpeechConversation();
+  send(buffer, 'partial', 'I need flour.', 0, 'one', 1);
+  buffer.settle(MAX_SPEECH_QUIET_MS);
+  send(buffer, 'partial', 'I need flowers. Now find a florist', 6000, 'one', 2);
+  assert.deepEqual(buffer.snapshot().map((line) => [line.text, line.isFinal]), [['I need flour.', true], ['Now find a florist', false]]);
+  send(buffer, 'final', 'I need flowers. Now find a florist nearby.', 6100, 'one', 3);
+  assert.deepEqual(buffer.snapshot().map((line) => line.text), ['I need flour.', 'Now find a florist nearby.']);
+  buffer.settle(6100 + SENTENCE_QUIET_MS);
+  assert.equal(send(buffer, 'final', 'I need flowers. Now find a florist nearby.', 8000, 'one', 4).changed, false);
+  assert.equal(buffer.snapshot().length, 2);
+});
+
+test('corrected cumulative text cannot replay a topic marker already in the frozen prefix', () => {
+  const buffer = new SpeechConversation();
+  send(buffer, 'partial', 'Now I need flour.', 0, 'one', 1);
+  buffer.settle(MAX_SPEECH_QUIET_MS);
+  assert.equal(send(buffer, 'final', 'Now I need flowers.', 6000, 'one', 2).changed, false);
+  assert.equal(buffer.snapshot().length, 1);
+  send(buffer, 'partial', 'Now I need flowers. Now find a florist', 6100, 'one', 3);
+  assert.deepEqual(buffer.snapshot().map((line) => line.text), ['Now I need flour.', 'Now find a florist']);
 });

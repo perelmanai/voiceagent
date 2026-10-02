@@ -9,6 +9,12 @@ export type SpeechInput = {
 };
 
 type Segment = { id: string; text: string; final: boolean; sequence: number };
+type Recognition = {
+  turn: Turn;
+  segment: Segment;
+  sourceText: string;
+  frozenPrefix: string;
+};
 type Turn = {
   id: string;
   speaker: string;
@@ -59,10 +65,46 @@ function joinSegments(segments: Segment[]): string {
   return text;
 }
 
+// Cumulative ASR revisions can keep the same result ID after a timeout. Compare
+// words rather than punctuation/case so an inserted period cannot replay an old
+// sentence. A rewrite of already completed words is not a new conversation turn.
+function suffixAfterPrefix(prefix: string, text: string): string | null {
+  const words = (value: string) => [...value.matchAll(/[^\s.,!?;:"()[\]{}…“”]+/g)]
+    .map((match) => ({
+      key: match[0].toLowerCase().replace(/’/g, "'").replace(/^'+|'+$/g, ""),
+      start: match.index!,
+    })).filter((word) => word.key);
+  const frozen = words(prefix);
+  const incoming = words(text);
+  if (incoming.length < frozen.length || frozen.some((word, index) => word.key !== incoming[index]?.key)) {
+    // A correction to an old word must not swallow a clearly new request:
+    // "I need flour." -> "I need flowers. Now find a florist." Keep the old
+    // turn immutable, but retain an additional explicit topic transition.
+    const priorTopics = [...prefix.matchAll(new RegExp(`\\b${NEW_THOUGHT_PATTERN}`, "gi"))];
+    const incomingTopics = [...text.matchAll(new RegExp(`\\b${NEW_THOUGHT_PATTERN}`, "gi"))];
+    const nextTopic = incomingTopics[priorTopics.length];
+    return nextTopic ? text.slice(nextTopic.index!).trim() : null;
+  }
+  if (incoming.length === frozen.length) return "";
+  return text.slice(incoming[frozen.length].start).trim();
+}
+
+const NEW_THOUGHT_PATTERN = "(?:(?:now|next|also)[,:]?\\s+(?:i|we|can|could|please|find|show|book|look|search|let['’]s)\\b|moving on\\b|on another (?:topic|note)\\b|another (?:question|thing)\\b)";
+
+function startsNewThought(text: string): boolean {
+  return new RegExp(`^${NEW_THOUGHT_PATTERN}`, "i").test(text);
+}
+
+function hasCompleteChunks(segments: Segment[]): boolean {
+  return segments.length > 0 && segments.every((segment) => segment.final)
+    && sentenceQuietWindow(joinSegments(segments)) !== null;
+}
+
 /** Pure clock-driven buffer shared by phone and browser recognition events. */
 export class SpeechConversation {
   private turns: Turn[] = [];
-  private segments = new Map<string, { turn: Turn; segment: Segment }>();
+  private segments = new Map<string, Recognition>();
+  private latestRecognition = new Map<string, string>();
   private speaking = new Map<string, { key: string; updatedAt: number }>();
   private activitySequence = new Map<string, number>();
   private nextId = 0;
@@ -82,28 +124,33 @@ export class SpeechConversation {
   }
 
   accept(input: SpeechInput, now: number): { changed: boolean; completed: CompletedTurn[] } {
+    // Timers may be delayed in a background tab. A new utterance must not extend
+    // an expired turn just because its timer callback has not run yet.
+    const speakingBefore = this.speaking.size;
+    const completed = this.settle(now);
+    const settledChanged = completed.length > 0 || speakingBefore !== this.speaking.size;
+    const result = (changed: boolean) => ({ changed: changed || settledChanged, completed });
     const key = `${input.speaker}:${input.utteranceId}`;
     const previous = this.segments.get(key);
     const sequence = input.sequence ?? (previous ? previous.segment.sequence + 1 : 0);
     if (input.sequence !== undefined) {
       const last = this.activitySequence.get(key);
-      if (last !== undefined && sequence <= last) return { changed: false, completed: [] };
+      if (last !== undefined && sequence <= last) return result(false);
       this.activitySequence.set(key, sequence);
     }
 
     if (input.type === "pause") {
-      if (this.speaking.get(input.speaker)?.key !== key) return { changed: false, completed: [] };
+      if (this.speaking.get(input.speaker)?.key !== key) return result(false);
       this.speaking.delete(input.speaker);
       for (const turn of this.turns) {
         if (turn.speaker === input.speaker && !turn.settled) turn.updatedAt = now;
       }
-      return { changed: true, completed: [] };
+      return result(true);
     }
 
     if (input.type === "stop" || input.type === "end") {
       let changed = this.speaking.has(input.speaker);
       this.speaking.delete(input.speaker);
-      const completed: CompletedTurn[] = [];
       for (const turn of this.turns) {
         if (turn.speaker !== input.speaker || turn.settled) continue;
         for (const segment of turn.segments) {
@@ -119,49 +166,78 @@ export class SpeechConversation {
           changed = true;
         }
       }
-      return { changed, completed };
+      return result(changed);
     }
 
     if (input.type === "activity") {
-      if (previous?.segment.final) return { changed: false, completed: [] };
+      if (previous?.segment.final) return result(false);
       this.speaking.set(input.speaker, { key, updatedAt: now });
       for (const turn of this.turns) {
         if (turn.speaker === input.speaker && !turn.settled) turn.updatedAt = now;
       }
-      return { changed: true, completed: [] };
+      return result(true);
     }
 
-    const text = (input.text ?? "").replace(/\s+/g, " ").trim();
-    if (!text) return { changed: false, completed: [] };
+    const sourceText = (input.text ?? "").replace(/\s+/g, " ").trim();
+    if (!sourceText) return result(false);
     const final = input.type === "final";
-    // A fallback may have already analyzed this exact preview. A late final
-    // confirms it without reopening the turn or issuing duplicate suggestions.
-    if (final && previous?.turn.settled && previous.segment.text === text) {
-      previous.segment.final = true;
-      previous.segment.sequence = sequence;
-      if (this.speaking.get(input.speaker)?.key === key) this.speaking.delete(input.speaker);
-      return { changed: false, completed: [] };
+    let text = sourceText;
+    if (previous?.frozenPrefix) {
+      // Once a newer result ID starts, older cumulative revisions are stale.
+      // They must not append a new tail to either the old or the current turn.
+      if (previous.turn.settled && this.latestRecognition.get(input.speaker) !== key) return result(false);
+      const suffix = suffixAfterPrefix(previous.frozenPrefix, sourceText);
+      if (suffix === null || !suffix) {
+        if (final && suffix === "" && this.speaking.get(input.speaker)?.key === key) {
+          this.speaking.delete(input.speaker);
+          return result(true);
+        }
+        return result(false);
+      }
+      text = suffix;
     }
-    // Replayed finals and late partials must neither duplicate words nor reopen
-    // a sentence. A changed final may still correct its own stable segment ID.
-    if (previous && (
-      (previous.segment.final && !final) ||
-      (previous.segment.text === text && previous.segment.final === final)
-    )) return { changed: false, completed: [] };
+
+    // Revisions replace only an open segment. Completed text is immutable; any
+    // genuine cumulative suffix starts in a new turn below.
+    const active = previous && !previous.turn.settled ? previous : undefined;
+    if (active && (
+      (active.segment.final && !final) ||
+      (active.segment.text === text && active.segment.final === final)
+    )) return result(false);
+
+    // A new topic can be explicit before the silence timer elapses. If its
+    // first partial was only "Now", move that still-open segment out once the
+    // recognizer expands it to "Now I need..."; completed text stays separate.
+    if (active && startsNewThought(text) && active.turn === this.turns.at(-1)
+      && active.turn.segments.at(-1) === active.segment
+      && hasCompleteChunks(active.turn.segments.slice(0, -1))) {
+      active.turn.segments.pop();
+      completed.push(this.complete(active.turn));
+      const next: Turn = {
+        id: `turn-${++this.nextId}`, speaker: input.speaker,
+        startedAt: now, updatedAt: now, segments: [active.segment], settled: false,
+      };
+      active.turn = next;
+      this.turns.push(next);
+    }
 
     // Android's activity and final share an utterance ID. Browser audio activity
     // has its own ID and ends via onspeechend: an older result must not clear it.
     const activity = this.speaking.get(input.speaker);
     if (final && activity?.key === key) this.speaking.delete(input.speaker);
     else if (activity) activity.updatedAt = now;
-    if (previous) {
-      previous.segment.text = text;
-      previous.segment.final = final;
-      previous.segment.sequence = sequence;
-      previous.turn.updatedAt = now;
-      previous.turn.settled = false;
+    if (active) {
+      active.segment.text = text;
+      active.segment.final = final;
+      active.segment.sequence = sequence;
+      active.sourceText = sourceText;
+      active.turn.updatedAt = now;
     } else {
       const latest = this.turns.at(-1);
+      if (latest && latest.speaker === input.speaker && !latest.settled
+        && hasCompleteChunks(latest.segments) && startsNewThought(text)) {
+        completed.push(this.complete(latest));
+      }
       const turn = latest && latest.speaker === input.speaker && !latest.settled
         ? latest
         : {
@@ -176,9 +252,13 @@ export class SpeechConversation {
       const segment = { id: key, text, final, sequence };
       turn.segments.push(segment);
       turn.updatedAt = now;
-      this.segments.set(key, { turn, segment });
+      this.segments.set(key, {
+        turn, segment, sourceText,
+        frozenPrefix: previous?.frozenPrefix ?? "",
+      });
+      this.latestRecognition.set(input.speaker, key);
     }
-    return { changed: true, completed: [] };
+    return result(true);
   }
 
   nextDeadline(): number | null {
@@ -215,6 +295,12 @@ export class SpeechConversation {
 
   private complete(turn: Turn): CompletedTurn {
     turn.settled = true;
+    for (const segment of turn.segments) {
+      const recognition = this.segments.get(segment.id);
+      if (recognition?.turn === turn && recognition.segment === segment) {
+        recognition.frozenPrefix = recognition.sourceText;
+      }
+    }
     return { id: turn.id, speaker: turn.speaker, text: joinSegments(turn.segments) };
   }
 }

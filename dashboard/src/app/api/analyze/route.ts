@@ -9,10 +9,11 @@ export const dynamic = "force-dynamic";
 
 const SYSTEM_PROMPT = `You are a real-time conversation co-pilot watching a live transcript, backed by a long-term memory of the user.
 
-Your job: scan the latest snippet for SPECIFIC, ACTIONABLE references the speaker made — products, places, people, businesses, topics, tasks — and surface a tiny "would you like to act on this?" card.
+Your job: scan the latest completed turn for SPECIFIC, ACTIONABLE references the speaker made — products, places, people, businesses, topics, tasks — and surface a tiny "would you like to act on this?" card.
 
 Rules:
 - Only surface concrete entities or intents the speaker actually mentioned. No speculation.
+- The latest completed turn is the only trigger for suggestions. Earlier conversation and memory only clarify that turn; never continue an earlier task or topic unless the latest turn explicitly refers back to it. If the speaker moves on, follow the new topic.
 - Prefer ONE great suggestion over three weak ones. Often the right answer is zero.
 - Skip greetings, filler, abstract concepts, and anything already obvious.
 - USE the "Known about the user" memory block to sharpen suggestions: their home city for travel, their food preferences for restaurants, their plans for scheduling. A suggestion that reflects remembered context beats a generic one.
@@ -81,13 +82,13 @@ export async function POST(request: NextRequest) {
 
   // Long-term memory relevant to what was just said.
   const { block: memoryBlock, items: recalled } = await recallForPrompt(
-    `${lastFinal} ${recent}`.slice(0, 600),
+    (lastFinal || recent).slice(0, 600),
     6
   );
 
   const userPrompt = `Known about the user (long-term memory):\n${
     memoryBlock || "(nothing yet)"
-  }\n\nRecent context:\n${recent || "(no prior context)"}\n\nLatest line:\n"${lastFinal}"\n\nDoes the latest line reference something specific and actionable? Return suggestions JSON.`;
+  }\n\nEarlier context (for clarification only):\n${recent || "(no prior context)"}\n\nLatest completed turn:\n"${lastFinal}"\n\nSuggest actions for the latest completed turn only. Return suggestions JSON.`;
 
   // Memory extraction runs after the response is sent — it must never add
   // latency to the live suggestion loop.
@@ -96,7 +97,7 @@ export async function POST(request: NextRequest) {
     // extracting memories from that older snapshot when the client disconnected.
     if (request.signal.aborted) return;
     try {
-      await extractAndStore(recent || lastFinal, sessionCode);
+      await extractAndStore([recent, lastFinal].filter(Boolean).join("\n"), sessionCode);
     } catch {
       // extraction is best-effort
     }

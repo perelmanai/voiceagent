@@ -18,17 +18,6 @@ export function Transcript({ lines, isRecording }: Props) {
   }, [lines]);
 
   const empty = lines.length === 0;
-  // Recognition callbacks and sentence analysis boundaries are not speaker
-  // changes. Keep consecutive speech together in readable conversation blocks.
-  const groups: TranscriptLine[][] = [];
-  for (const line of lines) {
-    const previous = groups.at(-1);
-    if (previous && previous[0].speaker === line.speaker && previous.reduce((size, item) => size + item.text.length, 0) < 900) {
-      previous.push(line);
-    } else {
-      groups.push([line]);
-    }
-  }
 
   return (
     <div
@@ -48,22 +37,20 @@ export function Transcript({ lines, isRecording }: Props) {
         </div>
       ) : (
         <ol className="space-y-4 py-2" aria-label="Conversation transcript">
-          {groups.map((group) => (
+          {lines.map((line) => (
             <li
-              key={group[0].id}
+              key={line.id}
               className="grid grid-cols-[88px_1fr] items-baseline gap-x-3"
             >
               <span className="font-mono text-[11px] text-fg-faint tabular-nums pt-0.5">
-                [{group[0].ts}]
+                [{line.ts}]
               </span>
               <p className="text-[15px] leading-relaxed">
-                <span className="text-fg-muted">{group[0].speaker}:</span>{" "}
-                {group.map((line, index) => (
-                  <span key={line.id} className={line.isFinal ? "text-fg" : "text-fg/80"}>
-                    {index > 0 ? " " : ""}{line.text}
-                  </span>
-                ))}
-                {group.some((line) => !line.isFinal) && (
+                <span className="text-fg-muted">{line.speaker}:</span>{" "}
+                <span className={line.isFinal ? "text-fg" : "text-fg/80"}>
+                  {line.text}
+                </span>
+                {!line.isFinal && (
                   <span className="ml-2 text-[11px] text-fg-faint italic">Listening for the rest…</span>
                 )}
               </p>

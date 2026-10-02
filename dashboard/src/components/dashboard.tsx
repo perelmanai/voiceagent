@@ -91,8 +91,7 @@ export function Dashboard() {
   const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const analysisControllerRef = useRef<AbortController | null>(null);
   const analysisRevisionRef = useRef(0);
-  const analysisBacklogRef = useRef<CompletedTurn[]>([]);
-  const seenUrlsRef = useRef<Set<string>>(new Set());
+  const analysisBacklogRef = useRef<CompletedTurn | null>(null);
 
   useEffect(() => {
     const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -111,15 +110,16 @@ export function Dashboard() {
     analysisControllerRef.current = null;
   }, []);
 
-  const analyzeTurns = useCallback(async (completed: CompletedTurn[]) => {
-    if (!completed.length || !mountedRef.current) return;
+  const analyzeTurn = useCallback(async (completed: CompletedTurn) => {
+    if (!mountedRef.current) return;
     cancelAnalysis();
     analysisBacklogRef.current = completed;
     const revision = analysisRevisionRef.current;
     const controller = new AbortController();
     analysisControllerRef.current = controller;
     const recent = conversationRef.current!.snapshot()
-      .slice(-6)
+      .filter((line) => line.isFinal && line.id !== completed.id)
+      .slice(-5)
       .map((line) => `${line.speaker}: ${line.text}`)
       .join("\n");
     try {
@@ -128,7 +128,7 @@ export function Dashboard() {
         headers: { "Content-Type": "application/json" },
         signal: controller.signal,
         body: JSON.stringify({
-          lastFinal: completed.map((turn) => turn.text).join("\n"),
+          lastFinal: completed.text,
           recent,
           code: pairingCodeRef.current,
         }),
@@ -141,18 +141,19 @@ export function Dashboard() {
       // A pause can resume while the model is answering. Never show suggestions
       // for an older snapshot after speech has changed or the component unmounted.
       if (controller.signal.aborted || revision !== analysisRevisionRef.current || !mountedRef.current) return;
-      analysisBacklogRef.current = [];
+      analysisBacklogRef.current = null;
       setMemoryRefreshKey((k) => k + 1);
       if (Array.isArray(data.recalled)) setRecalledIds(data.recalled.map((r) => r.id));
       if (!Array.isArray(data.suggestions)) return;
       const fresh: Suggestion[] = [];
+      const seen = new Set<string>();
       for (const s of data.suggestions) {
         if (!s.title) continue;
         const isAgent = s.kind === "agent" && s.task?.trim();
         if (!isAgent && !s.url) continue;
         const dedupeKey = isAgent ? `agent:${s.task}` : s.url!;
-        if (seenUrlsRef.current.has(dedupeKey)) continue;
-        seenUrlsRef.current.add(dedupeKey);
+        if (seen.has(dedupeKey)) continue;
+        seen.add(dedupeKey);
         fresh.push({
           id: uid(),
           kind: (s.kind as Suggestion["kind"]) ?? "info",
@@ -164,7 +165,7 @@ export function Dashboard() {
           task: s.task,
         });
       }
-      if (fresh.length) setSuggestions((prev) => [...fresh, ...prev].slice(0, MAX_SUGGESTIONS));
+      setSuggestions(fresh.slice(0, MAX_SUGGESTIONS));
     } catch {
       // Aborted requests and transient network errors do not interrupt listening.
     } finally {
@@ -172,26 +173,40 @@ export function Dashboard() {
     }
   }, [cancelAnalysis]);
 
+  const analyzeWhenQuiet = useCallback((completed: CompletedTurn[]) => {
+    const conversation = conversationRef.current!;
+    const snapshot = conversation.snapshot();
+    const latest = completed.find((turn) => turn.id === snapshot.at(-1)?.id);
+    if (latest) analysisBacklogRef.current = latest;
+    const pending = analysisBacklogRef.current;
+    // Once newer words exist, an interrupted request for the previous thought
+    // must never resume, even if a delayed timer just completed that old turn.
+    if (pending && pending.id !== snapshot.at(-1)?.id) {
+      analysisBacklogRef.current = null;
+      return;
+    }
+    if (pending && !conversation.isSpeaking() && snapshot.every((line) => line.isFinal)
+      && !analysisControllerRef.current) {
+      void analyzeTurn(pending);
+    }
+  }, [analyzeTurn]);
+
   const settleSpeech = useCallback(() => {
     settleTimerRef.current = null;
     if (!mountedRef.current) return;
     const completed = conversationRef.current!.settle(Date.now());
     if (completed.length) {
       setLines(conversationRef.current!.snapshot());
-      void analyzeTurns(completed);
-    } else if (!conversationRef.current!.isSpeaking()
-      && conversationRef.current!.snapshot().every((line) => line.isFinal)
-      && !analysisControllerRef.current && analysisBacklogRef.current.length) {
-      // A recognizer may never send "end" after noise interrupts a request.
-      // The bounded activity timeout also resumes that interrupted analysis.
-      void analyzeTurns(analysisBacklogRef.current);
     }
+    // Also resume a request interrupted by noise with no newer transcript text.
+    analyzeWhenQuiet(completed);
     const deadline = conversationRef.current!.nextDeadline();
     if (deadline !== null) settleTimerRef.current = setTimeout(settleSpeech, Math.max(0, deadline - Date.now()));
-  }, [analyzeTurns]);
+  }, [analyzeWhenQuiet]);
 
   const processSpeech = useCallback((input: SpeechInput) => {
     if (!mountedRef.current) return;
+    const previousTurnId = conversationRef.current!.snapshot().at(-1)?.id;
     const update = conversationRef.current!.accept(input, Date.now());
     if (!update.changed) return;
     cancelAnalysis();
@@ -199,16 +214,14 @@ export function Dashboard() {
     settleTimerRef.current = null;
     const snapshot = conversationRef.current!.snapshot();
     setLines(snapshot);
-    if (update.completed.length) void analyzeTurns(update.completed);
-    else if ((input.type === "end" || input.type === "stop") && snapshot.every((line) => line.isFinal)
-      && !conversationRef.current!.isSpeaking() && analysisBacklogRef.current.length) {
-      // A cough/no-match cycle may interrupt a request without changing any
-      // words. Resume that request once the recognizer reports quiet again.
-      void analyzeTurns(analysisBacklogRef.current);
+    if (snapshot.at(-1)?.id !== previousTurnId) {
+      setSuggestions([]);
+      setRecalledIds([]);
     }
+    analyzeWhenQuiet(update.completed);
     const deadline = conversationRef.current!.nextDeadline();
     if (deadline !== null) settleTimerRef.current = setTimeout(settleSpeech, Math.max(0, deadline - Date.now()));
-  }, [analyzeTurns, cancelAnalysis, settleSpeech]);
+  }, [analyzeWhenQuiet, cancelAnalysis, settleSpeech]);
 
   // Partial revisions and stable audio chunks from the phone use the same turn
   // buffer as the local mic. Legacy phones can still send just {text}.
